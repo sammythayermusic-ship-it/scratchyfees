@@ -51,7 +51,7 @@ export type ScratchResult =
   | { ok: true; roundId: number; wallet: string; outcomes: TicketOutcome[] }
   | {
       ok: false
-      error: 'not_found' | 'not_live' | 'not_entered' | 'locked' | 'voided' | 'bad_request'
+      error: 'not_found' | 'not_live' | 'not_entered' | 'voided' | 'bad_request'
       message: string
     }
 
@@ -114,11 +114,11 @@ export class ScratchService {
     if (entry.voidedAt) return { ok: false, error: 'voided', message: entry.voidReason ?? 'tickets voided' }
 
     const now = this.now()
-    const lockHeld = entry.sessionId === sessionId && entry.lockExpiresAt && entry.lockExpiresAt > now
-    const lockFree = !entry.sessionId || !entry.lockExpiresAt || entry.lockExpiresAt <= now
-    if (!lockHeld && !lockFree) {
-      return { ok: false, error: 'locked', message: "this wallet's tickets are being scratched" }
-    }
+    // The session lock is ADVISORY (security review #3): wallets are pasted, never proven, so an exclusive lock
+    // could be grabbed by anyone who pastes a victim's wallet first — locking the real owner out until the
+    // tickets void. Any session may reveal; the prize always goes to the ticket's wallet, and the reveal is
+    // serialized on the round/entry/ticket rows below. The lock only drives the UI hint
+    // ("this wallet's tickets are being scratched") and records who scratched last.
 
     // ── §2.7 holdings re-check (outside any transaction) ──
     const balance = await this.balance(wallet, ids.length > 1)

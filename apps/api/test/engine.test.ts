@@ -300,13 +300,27 @@ describe('scratch', () => {
     const { tickets: ts } = await enterAndDrop(w, 'tabA')
     const other = await entriesSvc.enter({ wallet: w, sessionId: 'tabB', ip: '1.1.1.1' })
     expect('error' in other ? null : other.locked).toBe(true)
-    const blocked = await scratch.scratch('tabB', [ts[0]!.id])
-    expect(!blocked.ok && blocked.error).toBe('locked')
+    // advisory: tabB sees the hint but is never blocked from scratching (see security #3)
     clock += 46_000 // tabA idle past SESSION_LOCK_SECONDS
     const takeover = await entriesSvc.enter({ wallet: w, sessionId: 'tabB', ip: '1.1.1.1' })
     expect('error' in takeover ? null : takeover.locked).toBe(false)
     const ok = await scratch.scratch('tabB', [ts[0]!.id])
     expect(ok.ok).toBe(true)
+  })
+
+  it('the session lock is advisory: a griefer who pastes your wallet first can never lock you out (security #3)', async () => {
+    await setup()
+    await engine.tick()
+    const w = devAddress('olga')
+    const { tickets: ts } = await enterAndDrop(w, 'griefer') // the griefer pasted the wallet first and holds the hint
+    const owner = await entriesSvc.enter({ wallet: w, sessionId: 'owner', ip: '9.9.9.9' })
+    expect('error' in owner ? null : owner.locked).toBe(true) // UI hint: "this wallet's tickets are being scratched"
+    const res = await scratch.scratch('owner', [ts[0]!.id, ts[1]?.id ?? ts[0]!.id])
+    expect(res.ok).toBe(true) // …but the owner can always scratch their own tickets
+    const again = await scratch.scratch('griefer', [ts[0]!.id]) // a replay reveals the same stored outcome, pays nothing twice
+    expect(again.ok && res.ok && again.outcomes[0]!.prizeRaw).toBe(res.ok && res.outcomes[0]!.prizeRaw)
+    const tier = await database.db.select().from(payouts).where(eq(payouts.kind, 'tier'))
+    expect(tier.every((p) => p.wallet === w)).toBe(true) // prizes only ever go to the ticket's wallet
   })
 
   it('§2.7: selling below the snapshot tier voids the remaining tickets', async () => {

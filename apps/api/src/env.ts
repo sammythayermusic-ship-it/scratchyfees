@@ -167,8 +167,11 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   if ((env.DEV_FORCE_JACKPOT || env.DEV_FORCE_BREAKER_ROUND > 0) && env.SOLANA_CLUSTER === 'mainnet-beta') {
     throw new Error('DEV_FORCE_JACKPOT / DEV_FORCE_BREAKER_ROUND are devnet/localnet-only')
   }
-  if (env.NODE_ENV === 'production' && (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32)) {
-    throw new Error('ADMIN_TOKEN must be set (≥ 32 chars) in production')
+  if (
+    (env.NODE_ENV === 'production' || env.SOLANA_CLUSTER === 'mainnet-beta') &&
+    (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32)
+  ) {
+    throw new Error('ADMIN_TOKEN must be set (≥ 32 chars) in production and on mainnet')
   }
   if (env.CORS_ORIGINS.length === 0) {
     env.CORS_ORIGINS =

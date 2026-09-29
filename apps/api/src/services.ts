@@ -409,6 +409,9 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
     scratchyMint,
     excludedWallets,
     maxWalletsPerIpPerRound: env.MAX_WALLETS_PER_IP_PER_ROUND,
+    reservedHandles: [env.X_HANDLE, 'scratchyfees', 'scratchy', 'scratchyfeesfun', 'scratchy_fees'].map((h) =>
+      h.toLowerCase(),
+    ),
     sessionLockSeconds: env.SESSION_LOCK_SECONDS,
     beforeEnter: memory ? (w) => memory!.faucet(w) : undefined,
     outcomesFor: (rows) => scratch.outcomesFor(rows),

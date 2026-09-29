@@ -5,13 +5,13 @@ import { clientIp, fail, KeyedLimiter, sessionId } from './http'
 
 /**
  * POST /api/enter and POST /api/scratch (PLAN §3.2). Limits: per IP (@fastify/rate-limit, route config) and
- * per wallet + per (IP, wallet) here, so a griefer can't burn a victim's whole wallet quota. SCRATCH ALL is
- * a single request carrying up to 100 ticket ids and costs one unit.
+ * per (IP, wallet) here. There is deliberately NO global per-wallet bucket: the wallet is whatever the client
+ * sends, so a shared bucket lets anyone exhaust a victim's quota and lock them out (security review #2).
+ * SCRATCH ALL is a single request carrying up to 100 ticket ids and costs one unit.
  */
 export async function registerPlayRoutes(app: FastifyInstance, s: Services) {
   const env = s.config.env
-  const perWallet = new KeyedLimiter(env.RATE_LIMIT_WALLET_PER_MIN)
-  const perIpWallet = new KeyedLimiter(Math.max(10, Math.floor(env.RATE_LIMIT_WALLET_PER_MIN / 2)))
+  const perIpWallet = new KeyedLimiter(env.RATE_LIMIT_WALLET_PER_MIN)
 
   app.post(
     '/api/enter',
@@ -22,7 +22,7 @@ export async function registerPlayRoutes(app: FastifyInstance, s: Services) {
       const body = (req.body ?? {}) as { wallet?: unknown; x_handle?: unknown }
       const ip = clientIp(req, env.TRUST_CLOUDFLARE)
       const wallet = normalizeWalletAddress(body.wallet)
-      if (wallet && (!perWallet.take(wallet) || !perIpWallet.take(`${ip}|${wallet}`))) {
+      if (wallet && !perIpWallet.take(`${ip}|${wallet}`)) {
         return fail(reply, 429, 'rate_limited', 'slow down a little')
       }
       const res = await s.entries.enter({
@@ -58,7 +58,7 @@ export async function registerPlayRoutes(app: FastifyInstance, s: Services) {
       }
       const ip = clientIp(req, env.TRUST_CLOUDFLARE)
       const wallet = normalizeWalletAddress(body.wallet)
-      if (wallet && (!perWallet.take(wallet) || !perIpWallet.take(`${ip}|${wallet}`))) {
+      if (wallet && !perIpWallet.take(`${ip}|${wallet}`)) {
         return fail(reply, 429, 'rate_limited', 'slow down a little')
       }
       const res = await s.scratch.scratch(session, ids)
@@ -67,7 +67,6 @@ export async function registerPlayRoutes(app: FastifyInstance, s: Services) {
           not_found: 404,
           not_live: 409,
           not_entered: 404,
-          locked: 423,
           voided: 409,
           bad_request: 400,
         }[res.error]

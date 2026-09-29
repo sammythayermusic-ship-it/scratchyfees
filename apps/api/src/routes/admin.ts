@@ -16,16 +16,26 @@ import { adminAuthorized, fail, jsonSafe } from './http'
  * Every route requires `Authorization: Bearer <ADMIN_TOKEN>` (constant-time compare); without an
  * ADMIN_TOKEN configured the admin API is disabled entirely.
  */
-export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
+export async function registerAdminRoutes(root: FastifyInstance, s: Services) {
+  // An encapsulated plugin under the /api/admin prefix: the auth hook runs for EVERY route registered in it,
+  // decided by the router's match — never by string-matching the raw URL (which percent-encoding bypasses,
+  // e.g. /api/%61dmin/status).
+  await root.register(
+    async (app) => {
+      app.addHook('onRequest', async (req, reply) => {
+        if (!adminAuthorized(req, s.config.env.ADMIN_TOKEN))
+          return fail(reply, 401, 'unauthorized', 'admin token required')
+      })
+      await adminRoutes(app, s)
+    },
+    { prefix: '/api/admin' },
+  )
+}
+
+async function adminRoutes(app: FastifyInstance, s: Services) {
   const db = s.database.db
-  const token = s.config.env.ADMIN_TOKEN
 
-  app.addHook('onRequest', async (req, reply) => {
-    if (!req.url.startsWith('/api/admin')) return
-    if (!adminAuthorized(req, token)) return fail(reply, 401, 'unauthorized', 'admin token required')
-  })
-
-  app.get('/api/admin/status', async () => {
+  app.get('/status', async () => {
     const [rate] = await db.select().from(config).where(eq(config.key, 'payout_rate'))
     const problem = await db
       .select()
@@ -141,14 +151,14 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
   const audit = (kind: string, message: string, data?: Record<string, unknown>) =>
     s.alerter.notify({ kind: `admin.${kind}`, severity: 'warn', message, immediate: true, data })
 
-  app.post('/api/admin/pause', async (req, reply) => {
+  app.post('/pause', async (req, reply) => {
     const note = noteOf(req.body)
     if (!note) return fail(reply, 400, 'note_required', 'say why you are pausing (note)')
     await s.pauses.set('manual', note)
     return { ok: true, pauses: s.pauses.list() }
   })
 
-  app.post('/api/admin/resume', async (req, reply) => {
+  app.post('/resume', async (req, reply) => {
     const body = (req.body ?? {}) as { reason?: unknown; note?: unknown }
     const reason = String(body.reason ?? 'manual') as HardPauseReason
     if (!HARD_PAUSE_REASONS.includes(reason))
@@ -162,7 +172,7 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
     return { ok: true, pauses: s.pauses.list() }
   })
 
-  app.post('/api/admin/payout-rate', async (req, reply) => {
+  app.post('/payout-rate', async (req, reply) => {
     const raw = String((req.body as { rate?: unknown })?.rate ?? '')
     let ppm: bigint
     try {
@@ -187,7 +197,7 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
     return { ok: true, payoutRate: value, appliesFrom: 'next round' }
   })
 
-  app.post('/api/admin/payouts/:id/retry', async (req, reply) => {
+  app.post('/payouts/:id/retry', async (req, reply) => {
     const raw = (req.params as { id: string }).id
     if (!/^\d+$/.test(raw)) return fail(reply, 400, 'bad_request', 'invalid id')
     const note = noteOf(req.body)
@@ -235,7 +245,7 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
     return jsonSafe({ ok: true, payout: res.payout })
   })
 
-  app.post('/api/admin/wallets/:address/clear-handle', async (req, reply) => {
+  app.post('/wallets/:address/clear-handle', async (req, reply) => {
     const address = (req.params as { address: string }).address
     const [w] = await db
       .update(wallets)

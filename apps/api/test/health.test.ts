@@ -50,15 +50,15 @@ describe('api scaffold', () => {
         CHAIN_MODE: 'solana',
       }),
     ).toThrow(/PRICE_SOURCE=live/)
-    expect(() =>
-      loadConfig({
-        NODE_ENV: 'test',
-        SOLANA_CLUSTER: 'mainnet-beta',
-        ALLOW_MAINNET: 'yes',
-        CHAIN_MODE: 'solana',
-        PRICE_SOURCE: 'live',
-      }),
-    ).not.toThrow()
+    const mainnet = {
+      NODE_ENV: 'test',
+      SOLANA_CLUSTER: 'mainnet-beta',
+      ALLOW_MAINNET: 'yes',
+      CHAIN_MODE: 'solana',
+      PRICE_SOURCE: 'live',
+    }
+    expect(() => loadConfig(mainnet)).toThrow(/ADMIN_TOKEN/) // a strong admin token is required on mainnet too
+    expect(() => loadConfig({ ...mainnet, ADMIN_TOKEN: 'x'.repeat(32) })).not.toThrow()
   })
 
   it('production never runs on the in-memory chain', () => {

@@ -92,11 +92,10 @@ describe('HTTP API', () => {
     expect(round.you.ticketsRemaining).toBe(entered.entry.tickets.length)
     expect(round.nextRound.seedHash).toMatch(/^[0-9a-f]{64}$/)
 
-    // a second tab can't scratch
+    // a second tab sees the "being scratched" hint (the lock is advisory server-side — security review #3)
     const other = (await post('/api/enter', { wallet }, S2)).json()
     expect(other.locked).toBe(true)
     const ids = entered.entry.tickets.map((t: { id: string }) => t.id)
-    expect((await post('/api/scratch', { ticket_ids: ids, wallet }, S2)).statusCode).toBe(423)
 
     const res = await post('/api/scratch', { ticket_ids: ids, wallet })
     expect(res.statusCode).toBe(200)
@@ -134,6 +133,19 @@ describe('HTTP API', () => {
   it('admin: token required; pause/resume; PAYOUT_RATE validated to 0.3–0.8%', async () => {
     await boot()
     expect((await app!.inject({ method: 'GET', url: '/api/admin/status' })).statusCode).toBe(401)
+    // percent-encoded paths must not slip past the auth hook (security review #1)
+    for (const url of [
+      '/api/%61dmin/status',
+      '/api/admin%2Fstatus',
+      '/API/admin/status',
+      '/api/admin/status/',
+      '//api/admin/status',
+    ]) {
+      expect([401, 404]).toContain((await app!.inject({ method: 'GET', url })).statusCode)
+    }
+    expect(
+      (await app!.inject({ method: 'POST', url: '/api/%61dmin/pause', payload: { note: 'x' } })).statusCode,
+    ).toBe(401)
     const auth = { authorization: `Bearer ${ADMIN}` }
     expect(
       (

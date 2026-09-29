@@ -1,7 +1,7 @@
 import { entryTerms, holdingsUsdMicro, holdMoreNudge, isEligible, type EconomyConfig } from '@scratchy/core'
 import { and, asc, eq, sql } from 'drizzle-orm'
 import { normalizeWalletAddress } from '../chain/address'
-import type { ChainClient } from '../chain/types'
+import { TransientChainError, type ChainClient } from '../chain/types'
 import type { Db } from '../db/client'
 import { activity, entries, rounds, tickets, wallets } from '../db/schema'
 import type { PriceOracle } from '../oracle/types'
@@ -52,6 +52,8 @@ export type EnterError =
   | { error: 'too_many_wallets'; message: string }
 
 export interface EntryDeps {
+  /** X handles nobody may claim (the project's own), lowercase */
+  reservedHandles?: string[]
   db: Db
   chain: ChainClient
   oracle: PriceOracle
@@ -78,6 +80,8 @@ export class EntryService {
   private readonly activeWindow = new Map<string, number>()
   /** wallet → session that most recently pasted it (heartbeats from that session renew activity) */
   private readonly owners = new Map<string, string>()
+  /** wallets whose last paste showed a non-zero balance (or couldn't be read): only these count as activity */
+  private readonly holders = new Set<string>()
   private decimals: number | null = null
 
   constructor(private readonly d: EntryDeps) {
@@ -113,8 +117,13 @@ export class EntryService {
     const roundMs = this.d.economy.roundSeconds * 1000
     const window = Math.floor(now.getTime() / roundMs)
     if (window !== this.ipWindow) {
+      // per-window state only: keeps these maps bounded no matter how many wallets get pasted (review #6)
       this.ipWindow = window
       this.ipWallets.clear()
+      this.owners.clear()
+      this.holders.clear()
+      this.lastActivityWrite.clear()
+      this.activeWindow.clear()
     }
     const seen = this.ipWallets.get(input.ip) ?? new Set<string>()
     if (!seen.has(wallet) && seen.size >= this.d.maxWalletsPerIpPerRound) {
@@ -126,15 +135,30 @@ export class EntryService {
     seen.add(wallet)
     this.ipWallets.set(input.ip, seen)
     this.owners.set(wallet, input.sessionId)
-    // Decision C activity first: an RPC hiccup below must never cost a player the next drop (eligibility is
-    // decided from the snapshot at the drop anyway, not from this preview)
-    await this.markActive(wallet, now)
 
-    await this.d.beforeEnter?.(wallet)
-    const xHandle = EntryService.normalizeHandle(input.xHandle)
+    const handle = EntryService.normalizeHandle(input.xHandle)
+    // nobody gets to appear as the project (or overwrite someone's handle — see the upsert below)
+    const xHandle = handle && this.d.reservedHandles?.includes(handle.toLowerCase()) ? null : handle
 
-    // holdings preview at the live price
-    const bal = await this.d.chain.getTokenBalance(wallet, this.d.scratchyMint)
+    // holdings preview at the live price. Decision C activity is recorded for wallets that actually hold
+    // SCRATCHY — or whose balance couldn't be read (an RPC hiccup must never cost a player the next drop).
+    // Empty wallets are free to generate; counting them would let anyone bloat every drop's holdings reads
+    // (security review #5).
+    let bal
+    try {
+      await this.d.beforeEnter?.(wallet)
+      bal = await this.d.chain.getTokenBalance(wallet, this.d.scratchyMint)
+    } catch (e) {
+      if (e instanceof TransientChainError) {
+        this.holders.add(wallet)
+        await this.markActive(wallet, now)
+      }
+      throw e
+    }
+    if (bal.value > 0n) {
+      this.holders.add(wallet)
+      await this.markActive(wallet, now)
+    } else this.holders.delete(wallet)
     const prices = this.d.oracle.peek()
     const decimals = await this.scratchyDecimals()
     const h = prices.scratchyUsd ? holdingsUsdMicro(bal.value, decimals, prices.scratchyUsd.valueE18) : 0n
@@ -142,19 +166,26 @@ export class EntryService {
     const nudge = holdMoreNudge(h, this.d.economy)
     const eligible = isEligible(h, this.d.economy)
 
-    await this.d.db
+    const [stored] = await this.d.db
       .insert(wallets)
       .values({ address: wallet, xHandle, lastActiveAt: now, eligibleSince: eligible ? now : null })
       .onConflictDoUpdate({
         target: wallets.address,
         set: {
           lastActiveAt: now,
-          ...(xHandle ? { xHandle } : {}),
-          eligibleSince: eligible
-            ? sql`COALESCE(${wallets.eligibleSince}, ${now.toISOString()}::timestamptz)`
-            : null,
+          // first handle sticks: a stranger pasting your wallet can't rename you (admin can clear it)
+          ...(xHandle ? { xHandle: sql`COALESCE(${wallets.xHandle}, ${xHandle})` } : {}),
+          // no price → no verdict: an oracle outage must not reset a holder's REQUIRE_HOLD_ONE_ROUND clock
+          ...(prices.scratchyUsd
+            ? {
+                eligibleSince: eligible
+                  ? sql`COALESCE(${wallets.eligibleSince}, ${now.toISOString()}::timestamptz)`
+                  : null,
+              }
+            : {}),
         },
       })
+      .returning({ xHandle: wallets.xHandle })
     this.lastActivityWrite.set(wallet, now.getTime())
 
     const [live] = await this.d.db.select().from(rounds).where(eq(rounds.status, 'live')).limit(1)
@@ -186,7 +217,7 @@ export class EntryService {
     const nextDropAt = live ? live.endsAt : new Date((window + 1) * roundMs)
     return {
       wallet,
-      xHandle,
+      xHandle: stored?.xHandle ?? null,
       eligibleNow: eligible,
       holdingsRaw: bal.value.toString(),
       holdingsUsdMicro: h.toString(),
@@ -229,7 +260,7 @@ export class EntryService {
     const wallet = normalizeWalletAddress(walletInput)
     if (!wallet || this.owners.get(wallet) !== sessionId) return
     const now = this.now()
-    await this.markActive(wallet, now)
+    if (this.holders.has(wallet)) await this.markActive(wallet, now)
     const last = this.lastActivityWrite.get(wallet) ?? 0
     if (now.getTime() - last >= ACTIVITY_WRITE_THROTTLE_MS) {
       this.lastActivityWrite.set(wallet, now.getTime())
