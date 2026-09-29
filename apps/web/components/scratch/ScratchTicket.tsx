@@ -33,8 +33,8 @@ export interface ScratchTicketProps {
   onRevealed?: () => void
 }
 
-/** only the last specks auto-clear: the player scratches the ticket themselves (playtest feedback) */
-const AUTO_COMPLETE = 0.95
+/** you only have to scratch the SYMBOLS: once ~90% of the symbol row is uncovered the rest of the foil clears */
+const AUTO_COMPLETE = 0.9
 const HOLD_WITHOUT_OUTCOME = 0.25
 const MAX_DPR = 2
 
@@ -44,6 +44,7 @@ export function ScratchTicket(p: ScratchTicketProps) {
   const cardRef = useRef<HTMLDivElement>(null)
   const areaRef = useRef<HTMLDivElement>(null)
   const foilRef = useRef<HTMLCanvasElement>(null)
+  const symbolsRef = useRef<HTMLDivElement>(null)
   const flakeRef = useRef<HTMLCanvasElement>(null)
   const st = useRef({
     started: false,
@@ -86,7 +87,18 @@ export function ScratchTicket(p: ScratchTicketProps) {
     g.drawImage(foilTexture(w, h, dpr), 0, 0)
     s.dpr = dpr
     s.radius = Math.max(12, Math.min(22, rect.width / 16)) * dpr
-    s.coverage = new Coverage(48, 28, w, h)
+    // coverage counts only the three symbol slots (a little padding), not the whole ticket
+    const sym = symbolsRef.current?.getBoundingClientRect()
+    const pad = 4
+    const region = sym
+      ? {
+          x0: (sym.left - rect.left - pad) * dpr,
+          y0: (sym.top - rect.top - pad) * dpr,
+          x1: (sym.right - rect.left + pad) * dpr,
+          y1: (sym.bottom - rect.top + pad) * dpr,
+        }
+      : undefined
+    s.coverage = new Coverage(48, 28, w, h, region)
     const cr = card.getBoundingClientRect()
     flakes.width = Math.round(cr.width * dpr)
     flakes.height = Math.round((cr.height + 80) * dpr)
@@ -352,7 +364,7 @@ export function ScratchTicket(p: ScratchTicketProps) {
 
           <div ref={areaRef} className="scratch-area">
             <div className="reveal-layer">
-              <div className="flex items-center justify-center gap-2 sm:gap-3">
+              <div ref={symbolsRef} className="flex items-center justify-center gap-2 sm:gap-3">
                 {(o?.symbols ?? (['star', 'star', 'star'] as const)).map((sym, i) => (
                   <div
                     key={i}

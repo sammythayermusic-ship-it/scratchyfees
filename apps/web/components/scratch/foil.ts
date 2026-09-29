@@ -113,17 +113,44 @@ export function brush(radius: number): HTMLCanvasElement {
 }
 
 /** Coarse coverage grid (cells × cells) — cheap "how much is scratched" without getImageData. */
+/** a rectangle of the foil (canvas pixels) — only cells inside it count toward the ratio */
+export interface CoverageRegion {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
 export class Coverage {
   private readonly hit: Uint8Array
+  private readonly counts: Uint8Array
   private count = 0
+  private readonly total: number
 
   constructor(
     private readonly cols: number,
     private readonly rows: number,
     private readonly w: number,
     private readonly h: number,
+    region?: CoverageRegion,
   ) {
     this.hit = new Uint8Array(cols * rows)
+    this.counts = new Uint8Array(cols * rows)
+    const cw = w / cols
+    const ch = h / rows
+    let total = 0
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const cx = (col + 0.5) * cw
+        const cy = (row + 0.5) * ch
+        const inside = !region || (cx >= region.x0 && cx <= region.x1 && cy >= region.y0 && cy <= region.y1)
+        if (inside) {
+          this.counts[row * cols + col] = 1
+          total++
+        }
+      }
+    }
+    this.total = Math.max(1, total)
   }
 
   mark(x: number, y: number, r: number): void {
@@ -142,13 +169,14 @@ export class Coverage {
         const dy = (row + 0.5) * ch - y
         if (dx * dx + dy * dy <= rr) {
           this.hit[i] = 1
-          this.count++
+          if (this.counts[i]) this.count++
         }
       }
     }
   }
 
+  /** share of the counted region (the symbols) that has been scratched */
   get ratio(): number {
-    return this.count / this.hit.length
+    return this.count / this.total
   }
 }
