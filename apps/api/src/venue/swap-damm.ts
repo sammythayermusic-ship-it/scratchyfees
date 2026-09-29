@@ -40,7 +40,9 @@ export async function runMeasuredSwap(steps: MeasuredSwapSteps): Promise<SwapRes
   const tx = await steps.send()
   const after = await steps.readBalances(tx.slot)
   if (after.base.slot < tx.slot || after.quote.slot < tx.slot) {
-    throw new Error(`swap ${tx.signature} landed at slot ${tx.slot} but the balance view is older; re-measure`)
+    throw new Error(
+      `swap ${tx.signature} landed at slot ${tx.slot} but the balance view is older; re-measure`,
+    )
   }
   const inRaw = before.base.value - after.base.value
   const outRaw = after.quote.value - before.quote.value
@@ -85,7 +87,8 @@ export class DammPoolSwap implements SwapAdapter {
       o.quoteMint,
     )
     this.send =
-      o.send ?? ((tx, signers) => sendAndConfirmSignedWithSlot(o.connection, tx, signers, { label: 'damm-v2 swap2' }))
+      o.send ??
+      ((tx, signers) => sendAndConfirmSignedWithSlot(o.connection, tx, signers, { label: 'damm-v2 swap2' }))
   }
 
   async swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number): Promise<SwapResult> {

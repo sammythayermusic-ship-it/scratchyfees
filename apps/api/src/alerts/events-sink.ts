@@ -175,7 +175,8 @@ export function redactValue(value: unknown, secrets: readonly string[] = []): un
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value)) {
-      out[k] = SECRET_KEY_NAME.test(k) && v !== null && typeof v !== 'boolean' ? REDACTED : redactValue(v, secrets)
+      out[k] =
+        SECRET_KEY_NAME.test(k) && v !== null && typeof v !== 'boolean' ? REDACTED : redactValue(v, secrets)
     }
     return out
   }
@@ -189,7 +190,8 @@ export function sanitizeData(
 ): Record<string, unknown> | undefined {
   if (data === undefined || data === null) return undefined
   const safe = redactValue(toJsonSafe(data), secrets)
-  if (safe !== null && typeof safe === 'object' && !Array.isArray(safe)) return safe as Record<string, unknown>
+  if (safe !== null && typeof safe === 'object' && !Array.isArray(safe))
+    return safe as Record<string, unknown>
   return { value: safe }
 }
 

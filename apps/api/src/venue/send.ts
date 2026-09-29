@@ -1,10 +1,10 @@
 import {
   ComputeBudgetProgram,
   SendTransactionError,
-  Transaction,
   VersionedTransaction,
   type Connection,
   type Signer,
+  type Transaction,
 } from '@solana/web3.js'
 import bs58 from 'bs58'
 
@@ -156,15 +156,18 @@ export async function sendAndConfirmSignedWithSlot(
     try {
       const st = (await connection.getSignatureStatuses([signature])).value[0]
       if (st?.err) {
-        throw new VenueTxError(`${label}: failed on-chain: ${renderErr(st.err)} (${signature})`, 'onchain', signature)
+        throw new VenueTxError(
+          `${label}: failed on-chain: ${renderErr(st.err)} (${signature})`,
+          'onchain',
+          signature,
+        )
       }
       if (st && reached(st.confirmationStatus, commitment)) return { signature, slot: st.slot }
 
       const finalizedHeight = await connection.getBlockHeight('finalized')
       if (finalizedHeight > lastValidBlockHeight) {
-        const hist = (
-          await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })
-        ).value[0]
+        const hist = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true }))
+          .value[0]
         if (hist?.err) {
           throw new VenueTxError(
             `${label}: failed on-chain: ${renderErr(hist.err)} (${signature})`,

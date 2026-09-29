@@ -172,7 +172,9 @@ export function rpcBalanceReader(
         const res = await connection.getTokenAccountsByOwner(
           owner,
           { mint },
-          minContextSlot === undefined ? { commitment: 'confirmed' } : { commitment: 'confirmed', minContextSlot },
+          minContextSlot === undefined
+            ? { commitment: 'confirmed' }
+            : { commitment: 'confirmed', minContextSlot },
         )
         let total = 0n
         for (const { account } of res.value) total += readTokenAmount(account.data)
@@ -276,7 +278,15 @@ export interface PoolStatics {
   collectFeeMode: number
 }
 
-export type CpAmmLike = Pick<CpAmm, 'fetchPoolState' | 'fetchPositionState' | 'claimPositionFee2' | 'getQuote' | 'swap2'>
+export type CpAmmLike = Pick<
+  CpAmm,
+  | 'fetchPoolState'
+  | 'fetchPositionState'
+  | 'getUserPositionByPool'
+  | 'claimPositionFee2'
+  | 'getQuote'
+  | 'swap2'
+>
 
 /** Fetch the pool, validate its mints against SCRATCHY/PUMP and load both mints' decimals (right program). */
 export async function loadPoolStatics(
@@ -408,7 +418,13 @@ export class DammV2Venue implements VenueAdapter {
   }
 
   private async load(): Promise<VenueStatics> {
-    const { statics } = await loadPoolStatics(this.connection, this.cpAmm, this.pool, this.baseMint, this.quoteMint)
+    const { statics } = await loadPoolStatics(
+      this.connection,
+      this.cpAmm,
+      this.pool,
+      this.baseMint,
+      this.quoteMint,
+    )
     const positionState = await this.cpAmm.fetchPositionState(this.position)
     if (!positionState.pool.equals(this.pool)) {
       throw new Error(
@@ -416,17 +432,35 @@ export class DammV2Venue implements VenueAdapter {
           `not ${this.pool.toBase58()}`,
       )
     }
-    const positionNftAccount = derivePositionNftAccount(positionState.nftMint)
-    const nft = await this.connection.getAccountInfo(positionNftAccount, 'confirmed')
-    if (!nft) throw new Error(`position NFT account ${positionNftAccount.toBase58()} not found`)
-    const holder = readTokenOwner(nft.data)
-    if (!this.creator.publicKey.toBytes().every((b, i) => b === holder[i]) || readTokenAmount(nft.data) !== 1n) {
-      throw new Error(
-        `CREATOR ${this.creator.publicKey.toBase58()} does not hold the NFT of position ${this.position.toBase58()} ` +
-          `(it can't claim this position's fees)`,
-      )
+    // The NFT normally sits in the program's PDA account ["position_nft_account", nftMint]; if it was moved
+    // to another CREATOR account, find it among CREATOR's positions in this pool.
+    let positionNftAccount = derivePositionNftAccount(positionState.nftMint)
+    if (!(await this.holdsPositionNft(positionNftAccount, positionState.nftMint))) {
+      const mine = await this.cpAmm.getUserPositionByPool(this.pool, this.creator.publicKey)
+      const hit = mine.find((p) => p.position.equals(this.position))
+      if (!hit || !(await this.holdsPositionNft(hit.positionNftAccount, positionState.nftMint))) {
+        throw new Error(
+          `CREATOR ${this.creator.publicKey.toBase58()} does not hold the NFT of position ` +
+            `${this.position.toBase58()} (it can't claim this position's fees)`,
+        )
+      }
+      positionNftAccount = hit.positionNftAccount
     }
     return { ...statics, positionNftMint: positionState.nftMint, positionNftAccount }
+  }
+
+  /** the token account holds exactly 1 of the position NFT with CREATOR as its authority */
+  private async holdsPositionNft(account: PublicKey, nftMint: PublicKey): Promise<boolean> {
+    const info = await this.connection.getAccountInfo(account, 'confirmed')
+    if (!info || info.data.length < 72) return false
+    const mint = info.data.subarray(0, 32)
+    const holder = readTokenOwner(info.data)
+    const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i])
+    return (
+      same(mint, nftMint.toBytes()) &&
+      same(holder, this.creator.publicKey.toBytes()) &&
+      readTokenAmount(info.data) === 1n
+    )
   }
 
   /**
@@ -438,7 +472,11 @@ export class DammV2Venue implements VenueAdapter {
     const s = this.statics
     const out = [this.pool, this.position, derivePoolAuthority()]
     if (s) out.push(s.tokenAVault, s.tokenBVault, s.positionNftAccount)
-    else out.push(deriveTokenVaultAddress(this.baseMint, this.pool), deriveTokenVaultAddress(this.quoteMint, this.pool))
+    else
+      out.push(
+        deriveTokenVaultAddress(this.baseMint, this.pool),
+        deriveTokenVaultAddress(this.quoteMint, this.pool),
+      )
     return [...new Set(out.map((k) => k.toBase58()))]
   }
 
@@ -446,7 +484,10 @@ export class DammV2Venue implements VenueAdapter {
     const s = await this.init()
     const poolState = await this.cpAmm.fetchPoolState(this.pool)
     assertSamePool(poolState, s)
-    const vaults = await this.connection.getMultipleAccountsInfoAndContext([s.tokenAVault, s.tokenBVault], 'confirmed')
+    const vaults = await this.connection.getMultipleAccountsInfoAndContext(
+      [s.tokenAVault, s.tokenBVault],
+      'confirmed',
+    )
     const [va, vb] = vaults.value
     if (!va || !vb) throw new Error(`DAMM v2 pool ${this.pool.toBase58()}: vault account missing`)
     const reserves = toBaseQuote(readTokenAmount(va.data), readTokenAmount(vb.data), s.orientation)
@@ -459,7 +500,12 @@ export class DammV2Venue implements VenueAdapter {
       quoteDecimals: decimals.quote,
       baseReserveRaw: reserves.base,
       quoteReserveRaw: reserves.quote,
-      priceQuotePerBaseE18: poolPriceQuotePerBaseE18(bnToBig(poolState.sqrtPrice), s.decA, s.decB, s.orientation),
+      priceQuotePerBaseE18: poolPriceQuotePerBaseE18(
+        bnToBig(poolState.sqrtPrice),
+        s.decA,
+        s.decB,
+        s.orientation,
+      ),
       slot: vaults.context.slot,
     }
   }

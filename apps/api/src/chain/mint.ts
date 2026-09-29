@@ -66,7 +66,8 @@ export function decodeMintAccount(address: string, info: AccountInfo<Buffer> | n
   const extensions = types.map(extensionName)
 
   const hook = isToken2022 ? getTransferHook(mint) : null
-  const transferHookProgram = hook && !hook.programId.equals(PublicKey.default) ? hook.programId.toBase58() : null
+  const transferHookProgram =
+    hook && !hook.programId.equals(PublicKey.default) ? hook.programId.toBase58() : null
 
   const blocking: string[] = []
   for (const t of types) {

@@ -108,9 +108,14 @@ export class SolanaChainClient implements ChainClient {
     this.prizeAddress = opts.prize.publicKey.toBase58()
     this.creatorAddress = opts.creator ? opts.creator.publicKey.toBase58() : null
     this.computeUnitLimit = opts.computeUnitLimit ?? DEFAULT_COMPUTE_UNIT_LIMIT
-    this.fallbackPriorityFee = opts.fallbackPriorityFeeMicroLamports ?? DEFAULT_FALLBACK_PRIORITY_FEE_MICROLAMPORTS
+    this.fallbackPriorityFee =
+      opts.fallbackPriorityFeeMicroLamports ?? DEFAULT_FALLBACK_PRIORITY_FEE_MICROLAMPORTS
     this.fetchImpl = opts.fetch ?? ((url, init) => fetch(url, init))
-    if (!Number.isInteger(this.computeUnitLimit) || this.computeUnitLimit <= 0 || this.computeUnitLimit > 1_400_000) {
+    if (
+      !Number.isInteger(this.computeUnitLimit) ||
+      this.computeUnitLimit <= 0 ||
+      this.computeUnitLimit > 1_400_000
+    ) {
       throw new Error(`computeUnitLimit must be an integer in 1..1,400,000 (got ${this.computeUnitLimit})`)
     }
   }
@@ -124,7 +129,9 @@ export class SolanaChainClient implements ChainClient {
     return this.rpc('getSlot', () => this.connection.getSlot(commitment))
   }
 
-  async getHeightAndSlot(commitment: Commitment = 'confirmed'): Promise<{ blockHeight: number; slot: number }> {
+  async getHeightAndSlot(
+    commitment: Commitment = 'confirmed',
+  ): Promise<{ blockHeight: number; slot: number }> {
     const info = await this.rpc('getEpochInfo', () => this.connection.getEpochInfo(commitment))
     if (typeof info.blockHeight !== 'number') {
       throw new TransientChainError('getEpochInfo: the RPC did not report a block height')
@@ -145,7 +152,11 @@ export class SolanaChainClient implements ChainClient {
     return info
   }
 
-  async getTokenBalance(owner: string, mint: string, commitment: Commitment = 'confirmed'): Promise<BalanceAt> {
+  async getTokenBalance(
+    owner: string,
+    mint: string,
+    commitment: Commitment = 'confirmed',
+  ): Promise<BalanceAt> {
     const ownerPk = new PublicKey(owner)
     const mintPk = new PublicKey(mint)
     const r = await this.rpc('getTokenAccountsByOwner', () =>
@@ -251,7 +262,8 @@ export class SolanaChainClient implements ChainClient {
         programId,
       )
     } catch (e) {
-      if (e instanceof TokenError) throw new Error(`transfer instruction for ${req.mint}: ${e.name}`, { cause: e })
+      if (e instanceof TokenError)
+        throw new Error(`transfer instruction for ${req.mint}: ${e.name}`, { cause: e })
       throw toChainError('resolve transfer-hook accounts', e)
     }
     const { blockhash, lastValidBlockHeight } = await this.rpc('getLatestBlockhash', () =>
@@ -261,7 +273,13 @@ export class SolanaChainClient implements ChainClient {
     const instructions = [
       ComputeBudgetProgram.setComputeUnitLimit({ units: this.computeUnitLimit }),
       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Math.floor(req.priorityFeeMicroLamports) }),
-      createAssociatedTokenAccountIdempotentInstruction(signer.publicKey, destination, recipientPk, mintPk, programId),
+      createAssociatedTokenAccountIdempotentInstruction(
+        signer.publicKey,
+        destination,
+        recipientPk,
+        mintPk,
+        programId,
+      ),
       memoInstruction(req.memo, signer.publicKey),
       transferIx,
     ]
@@ -297,7 +315,13 @@ export class SolanaChainClient implements ChainClient {
     if (r.value.err === null || r.value.err === undefined) {
       return { ok: true, error: null, permanent: false, logs, unitsConsumed }
     }
-    return { ok: false, error: renderSimulationError(r.value.err, logs), permanent: false, logs, unitsConsumed }
+    return {
+      ok: false,
+      error: renderSimulationError(r.value.err, logs),
+      permanent: false,
+      logs,
+      unitsConsumed,
+    }
   }
 
   /** Broadcast signed bytes once (no preflight, no RPC-side retries — the payout worker re-broadcasts). */
@@ -324,7 +348,9 @@ export class SolanaChainClient implements ChainClient {
     results.forEach((r, i) => {
       const expected = chunks[i]!.length
       if (r.value.length !== expected) {
-        throw new TransientChainError(`getSignatureStatuses returned ${r.value.length} results for ${expected}`)
+        throw new TransientChainError(
+          `getSignatureStatuses returned ${r.value.length} results for ${expected}`,
+        )
       }
       for (const s of r.value) {
         if (!s) {
@@ -365,7 +391,10 @@ export class SolanaChainClient implements ChainClient {
 
   async getPayoutTx(signature: string, mint: string, senderOwner: string): Promise<ParsedPayoutTx | null> {
     const tx = await this.rpc('getParsedTransaction', () =>
-      this.connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' }),
+      this.connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: 'confirmed',
+      }),
     )
     if (!tx) return null
     return parsePayoutTx(signature, tx, mint, senderOwner)
@@ -440,7 +469,11 @@ export function memoInstruction(memo: string, signer: PublicKey): TransactionIns
  * an account-type byte + TLV extensions after byte 165). Null if the data is not a token account for
  * `mint` (and, when given, owned by `owner`).
  */
-export function decodeTokenAccountAmount(data: Uint8Array, mint: PublicKey, owner?: PublicKey): bigint | null {
+export function decodeTokenAccountAmount(
+  data: Uint8Array,
+  mint: PublicKey,
+  owner?: PublicKey,
+): bigint | null {
   if (data.length < 165) return null
   if (!bytesEqual(data.subarray(0, 32), mint.toBytes())) return null
   if (owner && !bytesEqual(data.subarray(32, 64), owner.toBytes())) return null
@@ -596,7 +629,8 @@ export function parsePayoutTx(
 
 /** JSON-RPC codes that mean the request itself is wrong (retrying cannot help) */
 const CALLER_ERROR_CODES = new Set([-32600, -32601, -32602])
-const CALLER_ERROR_MESSAGE = /invalid param|method not found|failed to deserialize|signature verification fail/i
+const CALLER_ERROR_MESSAGE =
+  /invalid param|method not found|failed to deserialize|signature verification fail/i
 
 /** RPC failures are transient (network, 429, 5xx, node behind, timeouts…) unless the request was malformed. */
 export function toChainError(label: string, e: unknown): Error {
