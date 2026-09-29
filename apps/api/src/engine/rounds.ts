@@ -239,7 +239,13 @@ export class RoundEngine {
           status: 'pending',
           serverSeedHash: 'pending',
         })
+        .onConflictDoNothing({ target: rounds.startsAt })
         .returning()
+      if (!row) {
+        // another engine instance created it first (leadership handover race): use theirs, never a second seed
+        const [existing] = await tx.select().from(rounds).where(eq(rounds.startsAt, startsAt))
+        return existing!
+      }
       if (forced) seed = grindJackpotSeed(forced, row!.id, this.d.economy.jackpotOdds)
       const [u] = await tx
         .update(rounds)
@@ -263,6 +269,9 @@ export class RoundEngine {
 
   async startRound(T: Date): Promise<void> {
     const pending = (await this.pendingRound()) ?? (await this.createPending(T))
+    // the oldest pending round is due (or overdue after downtime); one scheduled later means another
+    // instance already started this boundary and queued the next — nothing to do
+    if (pending.startsAt.getTime() > T.getTime()) return
     const endsAt = new Date(T.getTime() + this.roundMs)
     const cfg = await this.effectiveEconomy()
 
@@ -303,7 +312,9 @@ export class RoundEngine {
     }
 
     if (skipReason) {
-      await this.d.db.transaction(async (tx) => {
+      const skipped = await this.d.db.transaction(async (tx) => {
+        const [locked] = await tx.select().from(rounds).where(eq(rounds.id, pending.id)).for('update')
+        if (!locked || locked.status !== 'pending') return false // already started elsewhere
         if (genesis)
           await tx.insert(jackpot).values({ id: 1, amountRaw: J, seeded: true }).onConflictDoNothing()
         const [secret] = await tx.select().from(roundSecrets).where(eq(roundSecrets.roundId, pending.id))
@@ -321,7 +332,9 @@ export class RoundEngine {
             totalWeightedMicro: 0n,
           })
           .where(eq(rounds.id, pending.id))
+        return true
       })
+      if (!skipped) return
       await this.createPending(endsAt)
       this.emitDrop(pending.id, pending.serverSeedHash, T, endsAt, 0, 0, P, J, skipReason)
       this.d.alerter.notify({
@@ -379,6 +392,9 @@ export class RoundEngine {
     }
 
     const Jafter = await this.d.db.transaction(async (tx) => {
+      // exactly one start per round even if two instances race (no double jackpot accrual, no duplicate tickets)
+      const [locked] = await tx.select().from(rounds).where(eq(rounds.id, pending.id)).for('update')
+      if (!locked || locked.status !== 'pending') return null
       if (genesis)
         await tx.insert(jackpot).values({ id: 1, amountRaw: J, seeded: true }).onConflictDoNothing()
       const [lockedPot] = await tx.select().from(jackpot).where(eq(jackpot.id, 1)).for('update')
@@ -418,6 +434,7 @@ export class RoundEngine {
       }
       return next
     })
+    if (Jafter === null) return
     await this.createPending(endsAt)
     this.emitDrop(
       pending.id,

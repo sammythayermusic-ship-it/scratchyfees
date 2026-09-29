@@ -1,4 +1,12 @@
-import { MICRO, recomputeTicket, seedMatchesCommitment } from '@scratchy/core'
+import {
+  deriveTicket,
+  generateServerSeed,
+  MICRO,
+  recomputeTicket,
+  seedCommitment,
+  seedMatchesCommitment,
+  seedToHex,
+} from '@scratchy/core'
 import { and, asc, eq } from 'drizzle-orm'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Database } from '../src/db/client'
@@ -31,6 +39,7 @@ let monitorLowPool: boolean
 let bus: EventBus
 let events: EngineEvent[]
 let engine: RoundEngine
+let engineDeps: ConstructorParameters<typeof RoundEngine>[0]
 let scratch: ScratchService
 let entriesSvc: EntryService
 
@@ -60,7 +69,7 @@ async function setup(extraEnv: Record<string, string> = {}) {
     economy: cfg.economy,
     scratchyMint: services.scratchyMint,
   }
-  engine = new RoundEngine({
+  engineDeps = {
     ...common,
     pool: database.pool,
     monitor: {
@@ -75,7 +84,8 @@ async function setup(extraEnv: Record<string, string> = {}) {
     requireHoldOneRound: cfg.env.REQUIRE_HOLD_ONE_ROUND,
     wakeWorker: () => services.worker.wake(),
     now,
-  })
+  }
+  engine = new RoundEngine(engineDeps)
   scratch = new ScratchService({
     ...common,
     bus,
@@ -126,6 +136,25 @@ async function enterAndDrop(wallet: string, session = 's1', ip = '1.1.1.1') {
   // re-enter to take the scratch lock for the new round
   await entriesSvc.enter({ wallet, sessionId: session, ip })
   return { round: r, tickets: ts }
+}
+
+/** replace the pending round's committed seed with one satisfying `pred` (test-only; like the rehearsal's grinder) */
+async function forceSeed(pred: (seed: Uint8Array, roundId: number) => boolean) {
+  const [pending] = await database.db.select().from(rounds).where(eq(rounds.status, 'pending'))
+  for (let i = 0; i < 200_000; i++) {
+    const seed = generateServerSeed()
+    if (!pred(seed, pending!.id)) continue
+    await database.db
+      .update(roundSecrets)
+      .set({ serverSeed: seedToHex(seed) })
+      .where(eq(roundSecrets.roundId, pending!.id))
+    await database.db
+      .update(rounds)
+      .set({ serverSeedHash: seedCommitment(seed) })
+      .where(eq(rounds.id, pending!.id))
+    return
+  }
+  throw new Error('could not grind a seed')
 }
 
 describe('round engine', () => {
@@ -304,6 +333,10 @@ describe('scratch', () => {
     await setup({ ROUND_BREAKER: '0.000001' })
     await engine.tick()
     const w = devAddress('hank')
+    await forceSeed((seed, rid) => {
+      const t = deriveTicket(seed, w, rid, 0, 50_000n)
+      return t.tier > 0 && !t.jackpot
+    })
     const { round, tickets: ts } = await enterAndDrop(w)
     const res = await scratch.scratch(
       's1',
@@ -311,13 +344,12 @@ describe('scratch', () => {
     )
     if (!res.ok) throw new Error(res.message)
     const [tier] = await database.db.select().from(payouts).where(eq(payouts.kind, 'tier'))
-    if (!tier) return // no winning ticket in this draw (deterministic per wallet) — nothing to hold
-    expect(tier.status).toBe('held')
+    expect(tier!.status).toBe('held')
     const [r] = await database.db.select().from(rounds).where(eq(rounds.id, round.id))
     expect(r!.breakerTripped).toBe(true)
     clock += ROUND
     await engine.tick()
-    const [released] = await database.db.select().from(payouts).where(eq(payouts.id, tier.id))
+    const [released] = await database.db.select().from(payouts).where(eq(payouts.id, tier!.id))
     expect(released!.status).toBe('queued')
     const [v] = await database.db.select().from(rounds).where(eq(rounds.id, round.id))
     expect(v!.breakerVerified).toBe('ok')
@@ -382,5 +414,86 @@ describe('entries', () => {
       ip: 'b',
     })
     expect('error' in bad ? 'err' : bad.xHandle).toBe(null)
+  })
+})
+
+describe('concurrency (Phase 3 gate: double-scratch, jackpot race, engine handover)', () => {
+  it('double-scratch: two concurrent requests for the same tickets reveal once and pay once', async () => {
+    await setup()
+    await engine.tick()
+    const w = devAddress('kara')
+    await forceSeed((seed, rid) => {
+      const t = deriveTicket(seed, w, rid, 0, 50_000n)
+      return t.tier > 0 && !t.jackpot
+    })
+    const { tickets: ts } = await enterAndDrop(w)
+    expect(ts[0]!.tier).toBeGreaterThan(0)
+    const ids = ts.map((t) => t.id)
+    const [a, b] = await Promise.all([scratch.scratch('s1', ids), scratch.scratch('s1', ids)])
+    if (!a.ok || !b.ok) throw new Error('scratch failed')
+    expect(a.outcomes.map((o) => o.prizeRaw)).toEqual(b.outcomes.map((o) => o.prizeRaw))
+    const total = ts.reduce((sum, t) => sum + t.prizeRaw, 0n)
+    const paid = (await database.db.select().from(payouts).where(eq(payouts.kind, 'tier'))).reduce(
+      (sum, p) => sum + p.amountRaw,
+      0n,
+    )
+    expect(paid).toBe(total)
+    const [r] = await database.db.select().from(rounds).where(eq(rounds.id, ts[0]!.roundId))
+    expect(r!.realizedRaw).toBe(total)
+  })
+
+  it('jackpot race: two wallets hitting in the same round — the pot is paid exactly once', async () => {
+    await setup({ JACKPOT_ODDS: '2' })
+    await engine.tick()
+    const w1 = devAddress('lara')
+    const w2 = devAddress('mona')
+    await forceSeed(
+      (seed, rid) => deriveTicket(seed, w1, rid, 0, 2n).jackpot && deriveTicket(seed, w2, rid, 0, 2n).jackpot,
+    )
+    await entriesSvc.enter({ wallet: w1, sessionId: 'a', ip: '1.1.1.1' })
+    await entriesSvc.enter({ wallet: w2, sessionId: 'b', ip: '2.2.2.2' })
+    clock += ROUND
+    await engine.tick()
+    await entriesSvc.enter({ wallet: w1, sessionId: 'a', ip: '1.1.1.1' })
+    await entriesSvc.enter({ wallet: w2, sessionId: 'b', ip: '2.2.2.2' })
+    const r = await liveRound()
+    const first = async (w: string) =>
+      (
+        await database.db
+          .select()
+          .from(tickets)
+          .where(and(eq(tickets.roundId, r.id), eq(tickets.wallet, w), eq(tickets.idx, 0)))
+      )[0]!
+    const [t1, t2] = [await first(w1), await first(w2)]
+    expect(t1.jackpot && t2.jackpot).toBe(true)
+    const [pot] = await database.db.select().from(jackpot)
+    expect(pot!.amountRaw).toBeGreaterThan(0n)
+    const [x, y] = await Promise.all([scratch.scratch('a', [t1.id]), scratch.scratch('b', [t2.id])])
+    if (!x.ok || !y.ok) throw new Error('scratch failed')
+    const got = [x, y].map((res) => BigInt(res.outcomes[0]!.jackpotPrizeRaw))
+    expect(got.filter((g) => g === pot!.amountRaw)).toHaveLength(1)
+    expect(got[0]! + got[1]!).toBe(pot!.amountRaw)
+    const jps = await database.db.select().from(payouts).where(eq(payouts.kind, 'jackpot'))
+    expect(jps.reduce((sum, p) => sum + p.amountRaw, 0n)).toBe(pot!.amountRaw)
+    const [after] = await database.db.select().from(jackpot)
+    expect(after!.amountRaw).toBe(0n)
+  })
+
+  it('two engine instances racing one boundary start exactly one round (no double jackpot accrual)', async () => {
+    await setup()
+    await engine.tick()
+    const other = new RoundEngine(engineDeps)
+    clock += ROUND
+    const [potBefore] = await database.db.select().from(jackpot)
+    await Promise.all([engine.tick(), other.tick()])
+    await Promise.all([engine.tick(), other.tick()])
+    const all = await database.db.select().from(rounds).orderBy(asc(rounds.id))
+    const live = all.filter((x) => x.status === 'live')
+    expect(live).toHaveLength(1)
+    expect(all.filter((x) => x.status === 'pending')).toHaveLength(1)
+    expect(all.filter((x) => x.status === 'ended')).toHaveLength(1)
+    expect(new Set(all.map((x) => x.startsAt.getTime())).size).toBe(all.length)
+    const [potAfter] = await database.db.select().from(jackpot)
+    expect(potAfter!.amountRaw - potBefore!.amountRaw).toBe(live[0]!.jackpotAccrualRaw)
   })
 })
