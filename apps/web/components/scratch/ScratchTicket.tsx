@@ -33,7 +33,8 @@ export interface ScratchTicketProps {
   onRevealed?: () => void
 }
 
-const AUTO_COMPLETE = 0.6
+/** only the last specks auto-clear: the player scratches the ticket themselves (playtest feedback) */
+const AUTO_COMPLETE = 0.95
 const HOLD_WITHOUT_OUTCOME = 0.25
 const MAX_DPR = 2
 
@@ -84,8 +85,8 @@ export function ScratchTicket(p: ScratchTicketProps) {
     g.globalCompositeOperation = 'source-over'
     g.drawImage(foilTexture(w, h, dpr), 0, 0)
     s.dpr = dpr
-    s.radius = Math.max(16, Math.min(30, rect.width / 11)) * dpr
-    s.coverage = new Coverage(24, 14, w, h)
+    s.radius = Math.max(12, Math.min(22, rect.width / 16)) * dpr
+    s.coverage = new Coverage(48, 28, w, h)
     const cr = card.getBoundingClientRect()
     flakes.width = Math.round(cr.width * dpr)
     flakes.height = Math.round((cr.height + 80) * dpr)

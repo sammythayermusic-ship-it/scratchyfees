@@ -56,6 +56,12 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
   )
   const [result, setResult] = useState<EnterResult | null>(null)
   const [tickets, setTickets] = useState<Local[]>([])
+  // mirror for event handlers (state updaters must stay pure — no celebrating inside them)
+  const ticketsRef = useRef<Local[]>([])
+  useEffect(() => {
+    ticketsRef.current = tickets
+  }, [tickets])
+  const celebrated = useRef(new Set<string>())
   const [focus, setFocus] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -93,7 +99,10 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
           state: t.void ? 'void' : t.scratched ? 'revealed' : 'fresh',
         }))
         setTickets(ts)
-        setFocus(ts.find((t) => t.state === 'fresh')?.id ?? null)
+        // keep the player on the ticket they're looking at (e.g. its result) if it's still in this round
+        setFocus((prev) =>
+          prev && ts.some((t) => t.id === prev) ? prev : (ts.find((t) => t.state === 'fresh')?.id ?? null),
+        )
       } catch (e) {
         setError(e instanceof ApiError ? e.message : 'Could not reach the server — try again in a moment.')
       } finally {
@@ -104,7 +113,12 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
   )
 
   // returning player: pick the saved wallet back up
+  // once per mount: `load` changes identity with every live snapshot, and re-entering on each tick used to
+  // re-run /api/enter constantly and yank the view off the ticket you just revealed
+  const restored = useRef(false)
   useEffect(() => {
+    if (restored.current) return
+    restored.current = true
     const w = savedWallet()
     if (w) void Promise.resolve().then(() => load(w)) // async kick-off: the fetch sets state when it resolves
   }, [load])
@@ -135,11 +149,8 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
   const focused = tickets.find((t) => t.id === focus) ?? null
 
   const advance = useCallback(() => {
-    setTickets((ts) => {
-      const next = ts.find((t) => t.state === 'fresh' && t.id !== focus)
-      setFocus(next?.id ?? null)
-      return ts
-    })
+    const next = ticketsRef.current.find((t) => t.state === 'fresh' && t.id !== focus)
+    setFocus(next?.id ?? null)
   }, [focus])
 
   const reveal = useCallback(async (ids: string[]) => {
@@ -191,17 +202,17 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
     [price],
   )
 
-  // focused ticket fully revealed
+  // focused ticket fully revealed: it STAYS on screen (Next ticket → moves on); wins pop the modal once
   const onRevealed = useCallback(
     (id: string) => {
-      setTickets((ts) => {
-        const t = ts.find((x) => x.id === id)
-        if (t?.outcome) celebrate([t.outcome])
-        return ts.map((x) => (x.id === id ? { ...x, state: 'revealed' } : x))
-      })
-      setTimeout(advance, 700)
+      const outcome = ticketsRef.current.find((x) => x.id === id)?.outcome ?? null
+      setTickets((ts) => ts.map((x) => (x.id === id ? { ...x, state: 'revealed' } : x)))
+      if (outcome && !celebrated.current.has(id)) {
+        celebrated.current.add(id)
+        setTimeout(() => celebrate([outcome]), 250) // let the rarity frame ignite first
+      }
     },
-    [advance, celebrate],
+    [celebrate],
   )
 
   const doScratchAll = useCallback(async () => {
@@ -226,6 +237,7 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
       () => {
         setScratchAll(false)
         setFocus(null)
+        for (const o of outcomes) celebrated.current.add(o.ticketId)
         celebrate(outcomes)
       },
       160 + ids.length * Math.max(25, 140 - ids.length),
@@ -336,7 +348,13 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
               onStart={() => void reveal([focused.id])}
               onRevealed={() => onRevealed(focused.id)}
             />
-          ) : remaining.length === 0 ? (
+          ) : null}
+          {focused && focused.state === 'revealed' && !scratchAll ? (
+            <button type="button" className="btn-gold mx-auto w-full max-w-[380px] text-lg" onClick={advance}>
+              {remaining.length > 0 ? 'Next ticket →' : 'Done'}
+            </button>
+          ) : null}
+          {!focused && !scratchAll && remaining.length === 0 ? (
             <div className="panel p-6 text-center">
               <p className="font-display text-2xl">All scratched!</p>
               <p className="mt-1 text-muted">
