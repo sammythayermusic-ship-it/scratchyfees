@@ -27,6 +27,7 @@ export interface RoundEndEvent {
 export interface WinnerEvent {
   type: 'winner'
   roundId: number
+  ticketId: string
   wallet: string
   xHandle: string | null
   tier: number

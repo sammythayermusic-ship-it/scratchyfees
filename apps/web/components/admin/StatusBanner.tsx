@@ -132,6 +132,14 @@ export function StatusBanner({
               further change re-pauses.
             </p>
           ) : null}
+          {reason === 'mint_changed' && status.mint ? (
+            <div className="rounded-lg bg-stage/60 p-2 font-mono text-[11px] text-ink">
+              <p className="text-muted">reviewed (mint.ack):</p>
+              <p className="break-all">{status.mint.accepted ?? '—'}</p>
+              <p className="mt-1 text-muted">on chain now:</p>
+              <p className="break-all">{status.mint.current ?? `unreadable: ${status.mint.error ?? '?'}`}</p>
+            </div>
+          ) : null}
           {others.length > 0 ? (
             <p className="text-gold">
               Payouts stay paused: {others.map((p) => p.reason).join(', ')} still active.

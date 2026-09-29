@@ -131,9 +131,12 @@ export type LiveEvent =
   | {
       type: 'winner'
       roundId: number
+      ticketId: string
       wallet: string
       xHandle: string | null
       tier: TierId
+      /** the winner's multiplier that round (micro-units, 1_000_000 = 1×) */
+      multMicro: string
       prizeRaw: string
       jackpot: boolean
       jackpotPrizeRaw: string

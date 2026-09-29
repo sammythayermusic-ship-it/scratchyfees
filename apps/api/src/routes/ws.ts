@@ -30,7 +30,12 @@ export async function registerWs(app: FastifyInstance, s: Services, allowedOrigi
 
   s.bus.on((e: EngineEvent) => {
     for (const c of clients) {
-      if (e.type === 'payout' || e.type === 'void') {
+      if (e.type === 'payout') {
+        // a confirmed PRIZE payout is public on-chain anyway: everyone gets it (the winners feed flips to "paid");
+        // every intermediate status goes only to the sockets watching that wallet
+        const publicConfirm = e.status === 'confirmed' && (e.kind === 'tier' || e.kind === 'jackpot')
+        if (publicConfirm || c.wallet === e.wallet) send(c, e)
+      } else if (e.type === 'void') {
         if (c.wallet === e.wallet) send(c, e)
       } else send(c, e)
     }

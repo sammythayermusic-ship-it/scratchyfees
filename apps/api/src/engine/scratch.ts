@@ -252,10 +252,11 @@ export class ScratchService {
       this.d.bus.emit({
         type: 'winner',
         roundId,
+        ticketId: o.ticketId,
         wallet,
         xHandle: w?.xHandle ?? null,
         tier: o.tier,
-        multMicro: '0',
+        multMicro: (entry?.multMicro ?? 0n).toString(),
         prizeRaw: o.prizeRaw,
         jackpot: o.jackpotPrizeRaw !== '0',
         jackpotPrizeRaw: o.jackpotPrizeRaw,

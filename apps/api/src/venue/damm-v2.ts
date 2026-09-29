@@ -89,6 +89,13 @@ export function orientPool(
 }
 
 /** Map a token A / token B pair onto base (SCRATCHY) / quote (PUMP). */
+/** Which token the pool's fees accrue in. DAMM v2 OnlyB (=1) means token B — PUMP only in a base-is-a pool. */
+export type FeeCollection = 'quote-only' | 'base-only' | 'both'
+export function feeCollection(collectFeeMode: number, orientation: PoolOrientation): FeeCollection {
+  if (collectFeeMode !== 1) return 'both'
+  return orientation === 'base-is-a' ? 'quote-only' : 'base-only'
+}
+
 export function toBaseQuote<T>(a: T, b: T, orientation: PoolOrientation): { base: T; quote: T } {
   return orientation === 'base-is-a' ? { base: a, quote: b } : { base: b, quote: a }
 }
@@ -334,6 +341,12 @@ export class DammV2Venue implements VenueAdapter {
       opts.send ??
       ((tx, signers) =>
         sendAndConfirmSignedWithSlot(this.connection, tx, signers, { label: 'damm-v2 claimPositionFee2' }))
+  }
+
+  /** where the pool's trading fees accrue: PUMP only (the launch config), SCRATCHY only, or both */
+  async feeCollection(): Promise<FeeCollection> {
+    const s = await this.init()
+    return feeCollection(s.collectFeeMode, s.orientation)
   }
 
   /** Construct and validate (pool mints, decimals, position ↔ pool, CREATOR holds the position NFT). */

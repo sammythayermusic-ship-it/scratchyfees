@@ -142,7 +142,12 @@ export function ProblemPayouts({
                 <div>
                   <dt className="text-muted">tx</dt>
                   <dd>
-                    <Tx sig={p.txSig} cluster={status.cluster} />
+                    <Tx sig={p.txSig ?? p.attempt?.lastSignature ?? null} cluster={status.cluster} />
+                    {p.attempt ? (
+                      <span className="ml-1 text-xs text-muted">
+                        (attempt {p.attempt.attempts}: {p.attempt.lastStatus})
+                      </span>
+                    ) : null}
                   </dd>
                 </div>
                 <div>

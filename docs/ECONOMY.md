@@ -96,6 +96,8 @@ binds above PAYOUT_RATE ≈ 0.56% (tested at 0.8%). "Dumped below its snapshot t
 | `low_gas`          | PRIZE SOL < MIN_GAS_SOL                                                                                                                                                                | automatic at threshold × (1 + RESERVE_HYSTERESIS)                       |
 | `invariant`        | an **unexplained outflow** from the PRIZE wallet (possible key compromise)                                                                                                             | **manual** (admin)                                                      |
 | `manual`           | admin                                                                                                                                                                                  | admin                                                                   |
+| `mint_changed`     | the payout mint's Token-2022 extensions / transfer hook changed (review before paying)                                                                                                 | **manual** (admin; resuming accepts the new mint state)                 |
+| `payouts_stuck`    | one PRIZE payout failed simulation 10× in a row (never retry silently forever)                                                                                                         | **manual** (admin, after fixing the cause)                              |
 
 While paused, scratches still reveal and wins queue — nothing is ever dropped. Reserve and gas pauses also hold
 jackpot payouts; the breaker never holds a jackpot. Every pause, resume, breaker event, sweep and payout goes to

@@ -1,0 +1,31 @@
+# systemd unit for the $SCRATCHY API (one process per deployment — see docs/RUNBOOK.md).
+# Install: sudo cp deploy/scratchy-api.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#          sudo systemctl enable --now scratchy-api
+# Secrets live ONLY in /etc/scratchy/api.env (owner root, mode 0600) — never in the repo.
+[Unit]
+Description=$SCRATCHY API (round engine, payouts, fee sweeper)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scratchy
+Group=scratchy
+WorkingDirectory=/opt/scratchy/apps/api
+EnvironmentFile=/etc/scratchy/api.env
+# node 22 + the tsx loader straight from apps/api/node_modules (no pnpm at runtime); adjust the path to `which node`
+ExecStart=/usr/bin/node --import tsx src/main.ts
+Restart=always
+RestartSec=5
+# graceful stop: in-flight sweeps and payout steps finish; persisted payout attempts are resumed on boot
+KillSignal=SIGTERM
+TimeoutStopSec=90
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/scratchy
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

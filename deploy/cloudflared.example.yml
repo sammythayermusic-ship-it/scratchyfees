@@ -1,0 +1,11 @@
+# Cloudflare Tunnel for the API (recommended: the VPS then needs NO inbound ports open).
+#   cloudflared tunnel login && cloudflared tunnel create scratchy-api
+#   cloudflared tunnel route dns scratchy-api api.scratchyfees.fun
+#   copy this file to /etc/cloudflared/config.yml (fill in the tunnel id) → sudo cloudflared service install
+# With a tunnel, set TRUST_CLOUDFLARE=true in /etc/scratchy/api.env (client IPs come from CF-Connecting-IP).
+tunnel: <TUNNEL-ID>
+credentials-file: /etc/cloudflared/<TUNNEL-ID>.json
+ingress:
+  - hostname: api.scratchyfees.fun
+    service: http://127.0.0.1:4000 # websockets (/ws) pass through the tunnel
+  - service: http_status:404

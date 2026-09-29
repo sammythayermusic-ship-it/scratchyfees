@@ -210,7 +210,7 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
           'VENUE=damm-v2 needs CREATOR_WALLET_KEY/ADDRESS, VENUE_POOL_ADDRESS, VENUE_POSITION_ADDRESS',
         )
       }
-      venue = await DammV2Venue.create({
+      const damm = await DammV2Venue.create({
         connection,
         creator,
         pool: new PublicKey(env.VENUE_POOL_ADDRESS),
@@ -218,6 +218,23 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
         baseMint: new PublicKey(scratchyMint),
         quoteMint: new PublicKey(pumpMint),
       })
+      // Launch config: fees accrue ONLY in PUMP (collectFeeMode = OnlyB with PUMP as token B). A pool created
+      // the other way round would pile fees up in SCRATCHY, which never reaches the prize pool without a swap.
+      const fees = await damm.feeCollection()
+      if (fees !== 'quote-only') {
+        const msg = `venue pool ${env.VENUE_POOL_ADDRESS} collects fees in ${fees === 'both' ? 'BOTH tokens' : 'SCRATCHY only'}, not PUMP only`
+        if (env.SWAP === 'none')
+          throw new Error(
+            `${msg} — with SWAP=none the SCRATCHY part could never be paid out; fix the pool or set SWAP`,
+          )
+        alerter.notify({
+          kind: 'venue.fee_mode',
+          severity: 'warn',
+          message: `${msg}; SCRATCHY fees are swapped via SWAP=${env.SWAP}`,
+          immediate: true,
+        })
+      }
+      venue = damm
     } else {
       throw new Error('CHAIN_MODE=solana requires VENUE=damm-v2')
     }

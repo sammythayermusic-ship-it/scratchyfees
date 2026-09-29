@@ -5,7 +5,7 @@
   "description": "$SCRATCHY API: round engine, payouts, fee sweeper, websocket feed (Fastify)",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --clear-screen=false src/main.ts",
+    "dev": "tsx watch --clear-screen=false --env-file-if-exists=../../.env src/main.ts",
     "start": "tsx src/main.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",

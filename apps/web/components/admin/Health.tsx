@@ -73,7 +73,14 @@ export function MonitorCard({ status, now }: { status: AdminStatus; now: number 
             </span>
           )}
         </KV>
-        <KV k="PRIZE SOL (gas)">
+        <KV
+          k="PRIZE SOL (gas)"
+          hint={
+            status.thresholds
+              ? `pauses below ${status.thresholds.minGasSol} SOL · resumes at ×${(1 + Number(status.thresholds.reserveHysteresis)).toFixed(2)}`
+              : undefined
+          }
+        >
           <span className={m.lowGas ? 'text-red-300' : ''}>{fmtSol(m.prizeSolLamports)} SOL</span>
         </KV>
         <KV k="CREATOR SOL" hint={m.creatorGasLow ? 'below its floor — alert only' : undefined}>

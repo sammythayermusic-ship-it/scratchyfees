@@ -42,7 +42,7 @@ function mergeHead(prev: Feed, page: WinnersPage): Feed {
   const fresh = page.recent.map<FeedRow>((r) => {
     const known = keyByTicket.get(r.ticketId)
     if (known) return { ...r, k: known }
-    const twin = placeholders.find((p) => !claimed.has(p.k) && sameWin(p, r))
+    const twin = placeholders.find((p) => !claimed.has(p.k) && (p.ticketId === r.ticketId || sameWin(p, r)))
     if (twin) {
       claimed.add(twin.k)
       return { ...r, k: twin.k }
@@ -133,12 +133,12 @@ export function WinnersBoard() {
     const row: FeedRow = {
       k: id,
       live: true,
-      ticketId: id,
+      ticketId: e.ticketId ?? id,
       roundId: e.roundId,
       wallet: e.wallet,
       xHandle: e.xHandle,
       tier: e.tier,
-      multMicro: null,
+      multMicro: e.multMicro && e.multMicro !== '0' ? e.multMicro : null,
       prizeRaw: e.prizeRaw,
       jackpotPrizeRaw: e.jackpotPrizeRaw,
       at: e.at,

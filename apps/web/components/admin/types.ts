@@ -78,6 +78,8 @@ export interface AdminPayout {
   createdAt: string
   sentAt: string | null
   confirmedAt: string | null
+  /** latest persisted attempt (problem payouts only) */
+  attempt?: { attempts: number; lastSignature: string; lastStatus: string; lastError: string | null } | null
 }
 
 export type Severity = 'info' | 'warn' | 'critical'
@@ -161,4 +163,15 @@ export interface AdminStatus {
   rounds: AdminRound[]
   wallets: { prize: string; creator: string | null; ops: string | null }
   cluster: string
+  serverTime?: string
+  /** payouts per status (all rows, not just the problem list) */
+  statusCounts?: Record<string, number>
+  thresholds?: {
+    minGasSol: string
+    minPoolReserveUsd: string
+    reserveHysteresis: string
+    minCreatorGasSol: string
+  }
+  /** payout-mint fingerprints: the reviewed one (mint.ack) vs what the chain says now */
+  mint?: { accepted: string | null; current: string | null; error?: string }
 }
