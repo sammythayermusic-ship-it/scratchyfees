@@ -34,6 +34,8 @@ export const MAX_ATTEMPTS = 4 // initial + "retry ×3" (PLAN §5)
 export const LEASE_MS = 30_000
 export const ABSENCE_RECHECK_MS = 10_000
 export const STUCK_SIM_FAILURES = 10
+/** consecutive ticks with RPC trouble before a (deduped) alert — payouts are delayed, never lost */
+export const RPC_TROUBLE_TICKS = 25
 const DEFAULT_CU = 120_000
 const MAX_CU = 1_400_000
 
@@ -85,6 +87,9 @@ export class PayoutWorker {
   private wakeResolve: (() => void) | null = null
   private loop: Promise<void> | null = null
   private readonly now: () => Date
+  /** transient RPC failures in the current tick / consecutive ticks with any (drives backoff + alert) */
+  private transientThisTick = 0
+  private troubledTicks = 0
 
   constructor(private readonly d: PayoutWorkerDeps) {
     this.id = d.workerId ?? `pw-${randomUUID().slice(0, 8)}`
@@ -112,8 +117,15 @@ export class PayoutWorker {
             dedupeKey: 'payout.worker_error',
           })
         }
+        // back off while the RPC is failing (rate limits, outages): 400 ms → up to 10 s, never give up
+        const delay =
+          this.troubledTicks > 0
+            ? Math.min(400 * 2 ** Math.min(this.troubledTicks, 5), 10_000)
+            : busy > 0
+              ? 400
+              : 1_000
         await new Promise<void>((res) => {
-          const t = setTimeout(res, busy > 0 ? 400 : 1_000)
+          const t = setTimeout(res, delay)
           this.wakeResolve = () => {
             clearTimeout(t)
             res()
@@ -132,7 +144,38 @@ export class PayoutWorker {
 
   /** Claim and process one batch. Returns how many payouts are still in flight/active. */
   async tick(): Promise<number> {
-    await this.watchSuperseded()
+    this.transientThisTick = 0
+    try {
+      return await this.tickInner()
+    } finally {
+      this.noteRpcHealth()
+    }
+  }
+
+  private noteRpcHealth(): void {
+    if (this.transientThisTick === 0) {
+      this.troubledTicks = 0
+      return
+    }
+    this.troubledTicks++
+    if (this.troubledTicks === RPC_TROUBLE_TICKS) {
+      this.d.alerter.notify({
+        kind: 'payout.rpc_trouble',
+        severity: 'warn',
+        message: `payout worker: RPC errors for ${RPC_TROUBLE_TICKS} ticks in a row (rate limit or outage) — payouts are delayed, not lost; check RPC_URL`,
+        dedupeKey: 'payout.rpc_trouble',
+        immediate: true,
+      })
+    }
+  }
+
+  private async tickInner(): Promise<number> {
+    try {
+      await this.watchSuperseded()
+    } catch (e) {
+      if (!(e instanceof TransientChainError)) throw e
+      this.transientThisTick++
+    }
     const claimed = await this.claim(this.d.gate.hold())
     if (claimed.length === 0) return 0
     let active = 0
@@ -146,7 +189,8 @@ export class PayoutWorker {
           if (await this.processOne(p, this.d.gate.hold())) active++
         } catch (e) {
           active++
-          if (!(e instanceof TransientChainError)) {
+          if (e instanceof TransientChainError) this.transientThisTick++
+          else {
             this.d.alerter.notify({
               kind: 'payout.error',
               severity: 'warn',

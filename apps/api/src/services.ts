@@ -151,7 +151,6 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       ...(env.RPC_WS_URL ? { wsEndpoint: env.RPC_WS_URL } : {}),
       // every RPC call is bounded, so no single payout step can outlive its lease
       fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(15_000) }),
-      disableRetryOnRateLimit: true,
     })
     const prize = keypairFromEnv(env.PRIZE_WALLET_KEY, env.PRIZE_WALLET_ADDRESS, 'PRIZE')
     const creator =

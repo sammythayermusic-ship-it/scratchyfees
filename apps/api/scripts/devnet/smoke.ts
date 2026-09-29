@@ -62,6 +62,15 @@ async function ensureDatabase(url: string): Promise<void> {
   await c.end()
 }
 
+/** the public devnet RPC rate-limits hard: poll the sweeper every few seconds, not every loop */
+const lastSweep = new Map<unknown, number>()
+async function sweepThrottled(s: Services | FeeSweeper): Promise<void> {
+  const sweeper = s instanceof FeeSweeper ? s : s.sweeper!
+  if (Date.now() - (lastSweep.get(sweeper) ?? 0) < 6_000) return
+  lastSweep.set(sweeper, Date.now())
+  await sweeper.runOnce()
+}
+
 async function until<T>(
   label: string,
   fn: () => Promise<T | null | undefined | false>,
@@ -123,6 +132,7 @@ async function main() {
     NODE_ENV: 'development',
     SWAP: 'none',
     ENGINE_ENABLED: 'false',
+    SWEEP_INTERVAL_MIN: '1440', // every sweep in the smoke is explicit (no timer racing the checks)
   })
   const env = config.env
   if (env.SOLANA_CLUSTER !== 'devnet' && env.SOLANA_CLUSTER !== 'localnet')
@@ -226,7 +236,7 @@ async function main() {
     const mainSweep = await until(
       'main sweep done',
       async () => {
-        await s.sweeper!.runOnce()
+        await sweepThrottled(s)
         const rows = await s.database.db.select().from(sweeps)
         const last = rows.at(-1)
         return last?.status === 'done' ? last : null
@@ -293,14 +303,14 @@ async function main() {
         p2.baseRaw > 0n,
         `${p2.baseRaw} raw SCRATCHY + ${p2.quoteRaw} raw PUMP`,
       )
-      const before = (await s.database.db.select().from(sweeps)).length
+      const beforeId = (await s.database.db.select().from(sweeps)).reduce((m, r) => (r.id > m ? r.id : m), 0n)
       const sweep2 = await until(
         'second sweep done',
         async () => {
-          await sweeper2.runOnce()
+          await sweepThrottled(sweeper2)
           const rows = await s.database.db.select().from(sweeps)
-          const last = rows.at(-1)
-          return rows.length > before && last?.status === 'done' ? last : null
+          const mine = rows.find((r) => r.id > beforeId && r.claimedScratchyRaw > 0n)
+          return mine?.status === 'done' ? mine : null
         },
         240_000,
       )

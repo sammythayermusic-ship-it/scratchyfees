@@ -116,15 +116,30 @@ const MOCK_PUMP_USD = '0.0056'
 const MAIN_FEE_BPS = 300
 
 /** minimum SOL per wallet (CREATOR additionally gets the one-time setup cost on top) */
-const SOL_MIN: Record<WalletName, bigint> = {
-  prize: 600_000_000n,
-  creator: 300_000_000n,
-  trader: 300_000_000n,
-  ops: 50_000_000n,
-  test1: 50_000_000n,
-  test2: 50_000_000n,
-  test3: 50_000_000n,
-}
+/**
+ * `--lean` (or DEVNET_LEAN=1): smaller floats (~0.9 SOL total) for when the faucet only hands out 1 SOL a day.
+ * PRIZE still keeps 0.35 SOL — far above MIN_GAS_SOL (0.1) for a day of rehearsal payouts incl. ATA rent.
+ */
+const LEAN = process.argv.includes('--lean') || process.env.DEVNET_LEAN === '1'
+const SOL_MIN: Record<WalletName, bigint> = LEAN
+  ? {
+      prize: 350_000_000n,
+      creator: 180_000_000n,
+      trader: 150_000_000n,
+      ops: 20_000_000n,
+      test1: 20_000_000n,
+      test2: 20_000_000n,
+      test3: 20_000_000n,
+    }
+  : {
+      prize: 600_000_000n,
+      creator: 300_000_000n,
+      trader: 300_000_000n,
+      ops: 50_000_000n,
+      test1: 50_000_000n,
+      test2: 50_000_000n,
+      test3: 50_000_000n,
+    }
 
 /** pool seeds in whole tokens; 100M : 10M sets the initial price to 0.1 mPUMP per mock-SCRATCHY */
 const MAIN_SEED = { base: 100_000_000n, quote: 10_000_000n }
@@ -179,6 +194,7 @@ const HELP = `devnet setup: provisions keys, SOL, mock mints, DAMM v2 pools and 
   --second-pool-config <a>  use this public static DAMM v2 config for the second pool
   --prize-seed <mPUMP>      mock-PUMP minted to PRIZE on the first run (default ${DEFAULT_PRIZE_SEED})
   --new-deploy-id           mint a fresh DEPLOY_ID (e.g. after resetting the database)
+  --lean                    smaller SOL floats (~0.9 SOL total) when the faucet only gives 1 SOL/day
   -h, --help
 
 env: RPC_URL (default https://api.devnet.solana.com), LOCALNET=1 (loopback test validator only),
@@ -194,6 +210,7 @@ function parseCli() {
       'second-pool-config': { type: 'string' },
       'prize-seed': { type: 'string', default: DEFAULT_PRIZE_SEED },
       'new-deploy-id': { type: 'boolean', default: false },
+      lean: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     strict: true,

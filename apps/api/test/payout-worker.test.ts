@@ -9,6 +9,7 @@ import {
   LEASE_MS,
   MAX_ATTEMPTS,
   PayoutWorker,
+  RPC_TROUBLE_TICKS,
   STUCK_SIM_FAILURES,
   type GateHold,
   type PayoutGate,
@@ -412,5 +413,20 @@ describe('payout worker — review regressions (exactly-once under races and slo
     await drive(w, 4)
     expect((await payout(toPrize!.id)).status).toBe('confirmed')
     expect((await chain.getTokenBalance(PRIZE, MINT)).value).toBe(700n)
+  })
+
+  it('an RPC outage delays payouts (alerting once), never loses or double-sends them', async () => {
+    const p = await queue(ALICE, 4_242n)
+    const w = worker()
+    await w.tick() // attempt persisted + sent
+    chain.faults.rpcDown = true
+    await drive(w, RPC_TROUBLE_TICKS + 3)
+    expect((await payout(p.id)).status).toBe('sending')
+    expect(alerter.events.filter((e) => e.kind === 'payout.rpc_trouble')).toHaveLength(1)
+    chain.faults.rpcDown = false
+    await drive(w, 6)
+    expect((await payout(p.id)).status).toBe('confirmed')
+    expect(chain.txCount()).toBe(1)
+    expect(await attemptsOf(p.id)).toHaveLength(1)
   })
 })
