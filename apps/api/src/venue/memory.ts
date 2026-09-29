@@ -1,5 +1,5 @@
 import type { MemoryChainClient } from '../chain/memory'
-import type { ClaimResult, PoolState, SwapAdapter, SwapResult, VenueAdapter } from './types'
+import type { ClaimResult, OnSwapSigned, PoolState, SwapAdapter, SwapResult, VenueAdapter } from './types'
 
 /**
  * In-memory stand-in for the launch venue (tests, local dev with CHAIN_MODE=memory, load tests).
@@ -11,6 +11,8 @@ import type { ClaimResult, PoolState, SwapAdapter, SwapResult, VenueAdapter } fr
  */
 
 export const MEMORY_POOL_ADDRESS = 'MemoryPoo1111111111111111111111111111111111'
+let claimCounter = 0
+let swapCounter = 0
 
 export interface MemoryVenueOptions {
   chain: MemoryChainClient
@@ -84,7 +86,17 @@ export class MemoryVenue implements VenueAdapter {
     this.pendingBase = 0n
     if (q > 0n) this.o.chain.credit(this.o.creator, this.o.quoteMint, q)
     if (b > 0n) this.o.chain.credit(this.o.creator, this.o.baseMint, b)
-    return { signatures: q > 0n || b > 0n ? [`mem-claim-${Date.now()}`] : [], claimedQuoteRaw: q, claimedBaseRaw: b }
+    if (q === 0n && b === 0n) return { signatures: [], claimedQuoteRaw: 0n, claimedBaseRaw: 0n }
+    const sig = `mem-claim-${++claimCounter}`
+    this.o.chain.recordTx(
+      sig,
+      this.o.creator,
+      new Map([
+        [this.o.quoteMint, q],
+        [this.o.baseMint, b],
+      ]),
+    )
+    return { signatures: [sig], claimedQuoteRaw: q, claimedBaseRaw: b }
   }
 
   async creatorLiquidityShare(): Promise<number> {
@@ -128,6 +140,9 @@ export class MemoryVenue implements VenueAdapter {
 export class MemorySwap implements SwapAdapter {
   readonly name = 'memory'
   failNext = 0
+  /** the swap lands on-chain but the client call throws afterwards (lost response / timeout) */
+  landThenThrowNext = 0
+  swaps = 0
 
   constructor(
     private readonly venue: MemoryVenue,
@@ -137,12 +152,18 @@ export class MemorySwap implements SwapAdapter {
     private readonly quoteMint: string,
   ) {}
 
-  async swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number): Promise<SwapResult> {
+  async swapBaseToQuote(
+    amountInRaw: bigint,
+    maxSlippageBps: number,
+    onSigned?: OnSwapSigned,
+  ): Promise<SwapResult> {
     if (amountInRaw <= 0n) return { signature: '', inRaw: 0n, outRaw: 0n }
     if (this.failNext > 0) {
       this.failNext--
       throw new Error('memory swap: failed (injected)')
     }
+    const signature = `mem-swap-${++swapCounter}`
+    await onSigned?.({ signature, lastValidBlockHeight: this.chain.currentHeight + 150 })
     const before = await this.venue.getPoolState()
     // constant-product quote before fees; the pool fee (≤ 3%) is allowed on top of the slippage cap
     const quoted = (before.quoteReserveRaw * amountInRaw) / (before.baseReserveRaw + amountInRaw)
@@ -151,6 +172,19 @@ export class MemorySwap implements SwapAdapter {
     if (out < minOut) throw new Error(`memory swap: out ${out} below slippage-capped minimum ${minOut}`)
     this.chain.transferExternal(this.owner, MEMORY_POOL_ADDRESS, this.baseMint, amountInRaw)
     this.chain.credit(this.owner, this.quoteMint, out)
-    return { signature: `mem-swap-${Date.now()}`, inRaw: amountInRaw, outRaw: out }
+    this.chain.recordTx(
+      signature,
+      this.owner,
+      new Map([
+        [this.baseMint, -amountInRaw],
+        [this.quoteMint, out],
+      ]),
+    )
+    this.swaps++
+    if (this.landThenThrowNext > 0) {
+      this.landThenThrowNext--
+      throw new Error('memory swap: response lost after landing (injected)')
+    }
+    return { signature, inRaw: amountInRaw, outRaw: out }
   }
 }

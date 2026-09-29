@@ -65,7 +65,7 @@ import {
   getTokenMetadata,
   getTransferHook,
 } from '@solana/spl-token'
-import { Keypair, PublicKey, SystemProgram, Transaction, type Connection } from '@solana/web3.js'
+import { PublicKey, SystemProgram, Transaction, type Connection, type Keypair } from '@solana/web3.js'
 import BN from 'bn.js'
 import { existsSync, readFileSync } from 'node:fs'
 import { relative } from 'node:path'
@@ -73,9 +73,10 @@ import { parseArgs } from 'node:util'
 import { REAL_PUMP_MINT, loadConfig } from '../../src/env'
 import {
   E18,
+  FAUCET_URL,
   REPO_ROOT,
   WALLET_NAMES,
-  baseRawForUsd,
+  baseRawForUsdE18,
   connectDevnet,
   envFilePath,
   errMessage,
@@ -138,6 +139,12 @@ const TEST_WALLETS: [WalletName, number][] = [
   ['test2', 600],
   ['test3', 5_000],
 ]
+/**
+ * Test holdings are sized at target +0.5%, rounded up: core floors H/$50 and H/$1,000, so an exact $600
+ * would sit on the 60-ticket boundary and drop to 55 tickets on the smallest price tick (likewise the 5×
+ * multiplier at $5,000). The cushion keeps each wallet inside its intended tier.
+ */
+const TEST_CUSHION_PERMILLE = 1_005n
 
 interface TokenMeta {
   name: string
@@ -268,7 +275,9 @@ function tokenMetadataLen(meta: TokenMeta): number {
 }
 
 function token2022MintSpace(hook: boolean): { mintLen: number; total: number } {
-  const exts = hook ? [ExtensionType.TransferHook, ExtensionType.MetadataPointer] : [ExtensionType.MetadataPointer]
+  const exts = hook
+    ? [ExtensionType.TransferHook, ExtensionType.MetadataPointer]
+    : [ExtensionType.MetadataPointer]
   const mintLen = getMintLen(exts)
   const meta = hook ? HOOK_META : PUMP_META
   return { mintLen, total: mintLen + TYPE_SIZE + LENGTH_SIZE + tokenMetadataLen(meta) }
@@ -279,8 +288,10 @@ function estimateSetupLamports(state: DevnetState, cli: Cli): { lamports: bigint
   const items: [string, bigint][] = []
   let txs = 0
   if (!state.mints.scratchy) items.push(['mock-SCRATCHY mint', rentExemptLamports(MINT_SIZE)])
-  if (!state.mints.pump) items.push(['mock-PUMP mint + metadata', rentExemptLamports(token2022MintSpace(false).total)])
-  if (!state.mints.hook) items.push(['HOOK-TEST mint + metadata', rentExemptLamports(token2022MintSpace(true).total)])
+  if (!state.mints.pump)
+    items.push(['mock-PUMP mint + metadata', rentExemptLamports(token2022MintSpace(false).total)])
+  if (!state.mints.hook)
+    items.push(['HOOK-TEST mint + metadata', rentExemptLamports(token2022MintSpace(true).total)])
   txs += items.length
   const pending = (key: string) => !state.distributions[key]
   const ataRents: bigint[] = []
@@ -300,11 +311,12 @@ function estimateSetupLamports(state: DevnetState, cli: Cli): { lamports: bigint
   for (const [name] of TEST_WALLETS) if (pending(`scratchy:${name}`)) ataRents.push(rentExemptLamports(165))
   txs += ataRents.length
   if (ataRents.length) items.push([`${ataRents.length} token accounts`, ataRents.reduce((a, b) => a + b, 0n)])
-  items.push([`~${txs + 2} transaction fees`, BigInt(txs + 2) * TX_FEE_ALLOWANCE])
+  // nothing left to build → no one-time overhead (a finished setup must not ask the faucet for fee dust)
+  if (items.length) items.push([`~${txs + 2} transaction fees`, BigInt(txs + 2) * TX_FEE_ALLOWANCE])
   const raw = items.reduce((s, [, v]) => s + v, 0n)
   const withMargin = (raw * 125n) / 100n
-  const step = 10_000_000n // round up to 0.01 SOL
-  const lamports = raw === 0n ? 0n : ((withMargin + step - 1n) / step) * step
+  const centiSol = 10_000_000n // round up to 0.01 SOL
+  const lamports = raw === 0n ? 0n : ((withMargin + centiSol - 1n) / centiSol) * centiSol
   const lines = items.map(([k, v]) => `${k}: ${fmtSol(v)}`)
   return { lamports, lines }
 }
@@ -335,8 +347,16 @@ async function ensureClassicMint(ctx: Ctx, mintKp: Keypair): Promise<MintRecord>
   if (info.decimals !== DECIMALS || !info.mintAuthority?.equals(creator.publicKey)) {
     return fail(`mock-SCRATCHY ${mint.toBase58()} has unexpected decimals or mint authority`)
   }
-  console.log(`  mock-SCRATCHY ${mint.toBase58()} (SPL Token, ${DECIMALS} dp)${signature ? '' : '  (existing)'}`)
-  return { address: mint.toBase58(), program: TOKEN_PROGRAM_ID.toBase58(), decimals: DECIMALS, extensions: [], signature }
+  console.log(
+    `  mock-SCRATCHY ${mint.toBase58()} (SPL Token, ${DECIMALS} dp)${signature ? '' : '  (existing)'}`,
+  )
+  return {
+    address: mint.toBase58(),
+    program: TOKEN_PROGRAM_ID.toBase58(),
+    decimals: DECIMALS,
+    extensions: [],
+    signature,
+  }
 }
 
 async function ensureToken2022Mint(
@@ -363,7 +383,14 @@ async function ensureToken2022Mint(
     )
     if (opts.hook) {
       // authority set, program id all-zero = None: the hook exists but executes nothing (real PUMP today)
-      tx.add(createInitializeTransferHookInstruction(mint, creator.publicKey, PublicKey.default, TOKEN_2022_PROGRAM_ID))
+      tx.add(
+        createInitializeTransferHookInstruction(
+          mint,
+          creator.publicKey,
+          PublicKey.default,
+          TOKEN_2022_PROGRAM_ID,
+        ),
+      )
     }
     tx.add(
       createInitializeMetadataPointerInstruction(mint, creator.publicKey, mint, TOKEN_2022_PROGRAM_ID),
@@ -401,12 +428,14 @@ async function ensureToken2022Mint(
     if (!hook.programId.equals(PublicKey.default)) {
       return fail(`${label} transfer-hook program must be unset, found ${hook.programId.toBase58()}`)
     }
-    if (!hook.authority.equals(creator.publicKey)) return fail(`${label} transfer-hook authority is not CREATOR`)
+    if (!hook.authority.equals(creator.publicKey))
+      return fail(`${label} transfer-hook authority is not CREATOR`)
   } else if (hook) {
     return fail(`${label} must NOT carry a TransferHook (Meteora DAMM v2 would require a token badge)`)
   }
   const meta = await getTokenMetadata(conn, mint, 'confirmed', TOKEN_2022_PROGRAM_ID)
-  if (meta?.symbol !== opts.meta.symbol) return fail(`${label} metadata symbol is ${meta?.symbol ?? 'missing'}`)
+  if (meta?.symbol !== opts.meta.symbol)
+    return fail(`${label} metadata symbol is ${meta?.symbol ?? 'missing'}`)
   console.log(
     `  ${label.padEnd(13)} ${mint.toBase58()} (Token-2022, ${DECIMALS} dp: ${names.join(', ')})` +
       `${signature ? '' : '  (existing)'}`,
@@ -450,7 +479,9 @@ async function ensureDistribution(
 ): Promise<void> {
   const done = ctx.state.distributions[key]
   if (done) {
-    console.log(`  ${wallet.toUpperCase().padEnd(8)} ${symbol.padEnd(14)} done earlier (target ${fmtTok(BigInt(done.targetRaw))})`)
+    console.log(
+      `  ${wallet.toUpperCase().padEnd(8)} ${symbol.padEnd(14)} done earlier (target ${fmtTok(BigInt(done.targetRaw))})`,
+    )
     return
   }
   const owner = ctx.wallets[wallet].publicKey
@@ -478,7 +509,8 @@ function flatFeeBps(data: number[]): number | null {
   } catch {
     return null
   }
-  if (mode !== BaseFeeMode.FeeTimeSchedulerLinear && mode !== BaseFeeMode.FeeTimeSchedulerExponential) return null
+  if (mode !== BaseFeeMode.FeeTimeSchedulerLinear && mode !== BaseFeeMode.FeeTimeSchedulerExponential)
+    return null
   const ts = decodePodAlignedFeeTimeScheduler(Buffer.from(data))
   const flat = ts.numberOfPeriod === 0 || ts.reductionFactor.isZero()
   return flat ? feeNumeratorToBps(ts.cliffFeeNumerator) : null
@@ -507,7 +539,9 @@ async function pickSecondPoolConfig(cpAmm: CpAmm): Promise<ConfigChoice | null> 
       Math.abs(a.feeBps - MAIN_FEE_BPS) - Math.abs(b.feeBps - MAIN_FEE_BPS) ||
       (a.index < b.index ? -1 : a.index > b.index ? 1 : 0),
   )
-  console.log(`  ${configs.length} public static configs, ${candidates.length} usable (BothToken, flat, full range)`)
+  console.log(
+    `  ${configs.length} public static configs, ${candidates.length} usable (BothToken, flat, full range)`,
+  )
   return candidates[0] ?? null
 }
 
@@ -522,7 +556,9 @@ async function adoptExistingPosition(ctx: Ctx, pool: PublicKey, nftMint: PublicK
         'cannot adopt it. Move .devnet/state.json and the mint-*.json keys aside to provision fresh mints.',
     )
   }
-  console.log(`  pool ${pool.toBase58()} already exists; adopting CREATOR position ${hit.position.toBase58()}`)
+  console.log(
+    `  pool ${pool.toBase58()} already exists; adopting CREATOR position ${hit.position.toBase58()}`,
+  )
   return { position: hit.position, nftMint: hit.positionState.nftMint }
 }
 
@@ -588,7 +624,12 @@ async function verifyRecordedPool(ctx: Ctx, rec: PoolRecord, label: string): Pro
   return rec
 }
 
-async function ensureMainPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord, nft: Keypair): Promise<PoolRecord> {
+async function ensureMainPool(
+  ctx: Ctx,
+  scratchy: MintRecord,
+  pump: MintRecord,
+  nft: Keypair,
+): Promise<PoolRecord> {
   const { state, cpAmm, conn, creator } = ctx
   if (state.pools.main) return verifyRecordedPool(ctx, state.pools.main, 'MAIN')
   const tokenAMint = new PublicKey(scratchy.address)
@@ -604,8 +645,20 @@ async function ensureMainPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord, 
   if (await cpAmm.isPoolExist(pool)) {
     ;({ position, nftMint } = await adoptExistingPosition(ctx, pool, nft.publicKey))
   } else {
-    await topUp(ctx, scratchy, creator.publicKey, seedBase + LP_DUST * UNIT, 'mock-SCRATCHY → CREATOR (MAIN liquidity)')
-    await topUp(ctx, pump, creator.publicKey, seedQuote + LP_DUST * UNIT, 'mock-PUMP → CREATOR (MAIN liquidity)')
+    await topUp(
+      ctx,
+      scratchy,
+      creator.publicKey,
+      seedBase + LP_DUST * UNIT,
+      'mock-SCRATCHY → CREATOR (MAIN liquidity)',
+    )
+    await topUp(
+      ctx,
+      pump,
+      creator.publicKey,
+      seedQuote + LP_DUST * UNIT,
+      'mock-PUMP → CREATOR (MAIN liquidity)',
+    )
     const prepared = cpAmm.preparePoolCreationParams({
       tokenAAmount: bn(seedBase),
       tokenBAmount: bn(seedQuote),
@@ -627,7 +680,13 @@ async function ensureMainPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord, 
       initSqrtPrice: prepared.initSqrtPrice,
       poolFees: {
         // flat 3%: start = end = 300 bps, no periods
-        baseFee: getFeeTimeSchedulerParams(MAIN_FEE_BPS, MAIN_FEE_BPS, BaseFeeMode.FeeTimeSchedulerLinear, 0, 0),
+        baseFee: getFeeTimeSchedulerParams(
+          MAIN_FEE_BPS,
+          MAIN_FEE_BPS,
+          BaseFeeMode.FeeTimeSchedulerLinear,
+          0,
+          0,
+        ),
         compoundingFeeBps: 0,
         padding: 0,
         dynamicFee: null,
@@ -640,7 +699,8 @@ async function ensureMainPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord, 
       tokenBProgram: TOKEN_2022_PROGRAM_ID,
       isLockLiquidity: true,
     })
-    if (!built.pool.equals(pool)) return fail(`SDK pool address ${built.pool.toBase58()} ≠ derived ${pool.toBase58()}`)
+    if (!built.pool.equals(pool))
+      return fail(`SDK pool address ${built.pool.toBase58()} ≠ derived ${pool.toBase58()}`)
     signature = await sendAndConfirm(conn, built.tx, [creator, nft], {
       label: 'create MAIN DAMM v2 pool',
       priorityMicroLamports: 0, // keep the legacy tx well under the size limit
@@ -680,12 +740,26 @@ async function ensureSecondPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord
   let config: PublicKey
   if (state.secondPoolConfig) {
     config = new PublicKey(state.secondPoolConfig)
+    if (cli.secondPoolConfig && !cli.secondPoolConfig.equals(config)) {
+      console.warn(`  ! ignoring --second-pool-config: state.json already pinned ${state.secondPoolConfig}`)
+    }
   } else if (cli.secondPoolConfig) {
     config = cli.secondPoolConfig
   } else {
-    const choice = await pickSecondPoolConfig(cpAmm)
+    let choice: ConfigChoice | null
+    try {
+      choice = await pickSecondPoolConfig(cpAmm)
+    } catch (e) {
+      // e.g. an RPC plan without getProgramAccounts: the SECOND pool is optional, the MAIN setup is not
+      console.warn(
+        `  ! could not list DAMM v2 configs (${errMessage(e)}); pass --second-pool-config <address>`,
+      )
+      return null
+    }
     if (!choice) {
-      console.warn('  ! no public static BothToken config found; SECOND pool skipped (swap path untestable on-chain)')
+      console.warn(
+        '  ! no public static BothToken config found; SECOND pool skipped (swap path untestable on-chain)',
+      )
       return null
     }
     config = choice.address
@@ -717,8 +791,20 @@ async function ensureSecondPool(ctx: Ctx, scratchy: MintRecord, pump: MintRecord
   if (await cpAmm.isPoolExist(pool)) {
     ;({ position, nftMint } = await adoptExistingPosition(ctx, pool, nft.publicKey))
   } else {
-    await topUp(ctx, scratchy, creator.publicKey, seedBase + LP_DUST * UNIT, 'mock-SCRATCHY → CREATOR (SECOND liquidity)')
-    await topUp(ctx, pump, creator.publicKey, seedQuote + LP_DUST * UNIT, 'mock-PUMP → CREATOR (SECOND liquidity)')
+    await topUp(
+      ctx,
+      scratchy,
+      creator.publicKey,
+      seedBase + LP_DUST * UNIT,
+      'mock-SCRATCHY → CREATOR (SECOND liquidity)',
+    )
+    await topUp(
+      ctx,
+      pump,
+      creator.publicKey,
+      seedQuote + LP_DUST * UNIT,
+      'mock-PUMP → CREATOR (SECOND liquidity)',
+    )
     const prepared = cpAmm.preparePoolCreationParams({
       tokenAAmount: bn(seedBase),
       tokenBAmount: bn(seedQuote),
@@ -780,13 +866,19 @@ function parseEnv(text: string): Map<string, string> {
     if (!m || line.trimStart().startsWith('#')) continue
     const key = m[1] as string
     let value = (m[2] ?? '').trim()
-    if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.endsWith(value[0])) value = value.slice(1, -1)
+    const q = value[0]
+    if (value.length >= 2 && (q === '"' || q === "'") && value.endsWith(q)) value = value.slice(1, -1)
     out.set(key, value)
   }
   return out
 }
 
-function buildEnvFile(ctx: Ctx, mints: { scratchy: MintRecord; pump: MintRecord; hook: MintRecord }, main: PoolRecord, second: PoolRecord | null): string {
+function buildEnvFile(
+  ctx: Ctx,
+  mints: { scratchy: MintRecord; pump: MintRecord; hook: MintRecord },
+  main: PoolRecord,
+  second: PoolRecord | null,
+): string {
   const { state, net, wallets } = ctx
   const managed: [string, string][] = [
     ['CHAIN_MODE', 'solana'],
@@ -911,49 +1003,76 @@ async function main(): Promise<void> {
       `CREATOR target = ${fmtSol(SOL_MIN.creator)} operating float + ${fmtSol(setup.lamports)} remaining one-time setup (25% margin):`,
       ...setup.lines.map((l) => `    ${l}`),
       'the faucet is asked only for CREATOR (≤ 1 SOL per request, exponential backoff); CREATOR then distributes',
-      `if the faucet refuses, the script prints exact amounts for ${FAUCET_HINT} and exits with code 2`,
+      `if the faucet refuses, the script prints exact amounts for ${FAUCET_URL} and exits with code 2`,
     ],
   )
   if (cli.dryRun) {
-    console.log(`\n--dry-run: nothing sent. ${toFund > 0n ? `${fmtSol(toFund)} still to fund.` : 'SOL is sufficient.'}`)
+    console.log(
+      `\n--dry-run: nothing sent. ${toFund > 0n ? `${fmtSol(toFund)} still to fund.` : 'SOL is sufficient.'}`,
+    )
     printPlan(state, cli)
     return
   }
 
   step('SOL')
-  const [creatorTarget, ...otherTargets] = targets
+  const creatorTarget = targets.find((t) => t.keypair === creator)
   if (!creatorTarget) return fail('internal: no CREATOR target')
+  const otherTargets = targets.filter((t) => t !== creatorTarget)
   await fundFromFunder(conn, creatorTarget, otherTargets, { noAirdrop: cli.noAirdrop })
   console.log('  all wallets at their minimum SOL')
 
   step('mints (authority CREATOR)')
-  const scratchy = (state.mints.scratchy ??= await ensureClassicMint(ctx, mintKeys.scratchy))
+  const mint = async (label: string, recorded: MintRecord | undefined, create: () => Promise<MintRecord>) => {
+    if (recorded) {
+      console.log(`  ${label.padEnd(13)} ${recorded.address} (recorded)`)
+      return recorded
+    }
+    return create()
+  }
+  const scratchy = (state.mints.scratchy = await mint('mock-SCRATCHY', state.mints.scratchy, () =>
+    ensureClassicMint(ctx, mintKeys.scratchy),
+  ))
   saveState(state)
-  const pump = (state.mints.pump ??= await ensureToken2022Mint(ctx, 'mock-PUMP', mintKeys.pump, { meta: PUMP_META, hook: false }))
+  const pump = (state.mints.pump = await mint('mock-PUMP', state.mints.pump, () =>
+    ensureToken2022Mint(ctx, 'mock-PUMP', mintKeys.pump, { meta: PUMP_META, hook: false }),
+  ))
   saveState(state)
-  const hook = (state.mints.hook ??= await ensureToken2022Mint(ctx, 'HOOK-TEST', mintKeys.hook, { meta: HOOK_META, hook: true }))
+  const hook = (state.mints.hook = await mint('HOOK-TEST', state.mints.hook, () =>
+    ensureToken2022Mint(ctx, 'HOOK-TEST', mintKeys.hook, { meta: HOOK_META, hook: true }),
+  ))
   saveState(state)
 
   step('prize + trader balances')
   await ensureDistribution(ctx, 'pump:prize', pump, 'mock-PUMP', 'prize', cli.prizeSeedRaw)
   await ensureDistribution(ctx, 'hook:prize', hook, 'HOOK-TEST', 'prize', HOOK_PRIZE_SEED * UNIT)
-  await ensureDistribution(ctx, 'scratchy:trader', scratchy, 'mock-SCRATCHY', 'trader', TRADER_INVENTORY.scratchy * UNIT)
+  await ensureDistribution(
+    ctx,
+    'scratchy:trader',
+    scratchy,
+    'mock-SCRATCHY',
+    'trader',
+    TRADER_INVENTORY.scratchy * UNIT,
+  )
   await ensureDistribution(ctx, 'pump:trader', pump, 'mock-PUMP', 'trader', TRADER_INVENTORY.pump * UNIT)
 
   step('MAIN pool (DAMM v2 custom: 3% flat, OnlyB, locked, CREATOR-owned)')
   const main = await ensureMainPool(ctx, scratchy, pump, nftKeys.main)
 
   step('SECOND pool (DAMM v2 static config: BothToken, swap-path exercise)')
-  const second = cli.skipSecondPool
-    ? (state.pools.second ?? (console.log('  skipped (--skip-second-pool)'), null))
-    : await ensureSecondPool(ctx, scratchy, pump, nftKeys.second)
+  let second: PoolRecord | null = state.pools.second ?? null
+  if (cli.skipSecondPool) {
+    console.log(`  skipped (--skip-second-pool)${second ? `; keeping recorded ${second.address}` : ''}`)
+  } else {
+    second = await ensureSecondPool(ctx, scratchy, pump, nftKeys.second)
+  }
 
-  step(`test wallets (≈ USD at the MAIN pool's initial price × mock PUMP $${MOCK_PUMP_USD})`)
+  step(`test wallets (≈ USD +0.5% at the MAIN pool's initial price × mock PUMP $${MOCK_PUMP_USD})`)
   const priceE18 = BigInt(main.initPriceQuotePerBaseE18)
   const pumpUsdE18 = parseUnits(MOCK_PUMP_USD, 18)
   state.testWallets ??= {}
   for (const [name, usd] of TEST_WALLETS) {
-    const amount = baseRawForUsd(BigInt(usd), priceE18, pumpUsdE18, DECIMALS)
+    const usdE18 = (BigInt(usd) * E18 * TEST_CUSHION_PERMILLE) / 1_000n
+    const amount = baseRawForUsdE18(usdE18, priceE18, pumpUsdE18, DECIMALS)
     state.testWallets[name] = { usdTarget: usd, scratchyRaw: amount.toString() }
     await ensureDistribution(ctx, `scratchy:${name}`, scratchy, 'mock-SCRATCHY', name, amount)
   }
@@ -969,8 +1088,6 @@ async function main(): Promise<void> {
   printSummary(ctx, { scratchy, pump, hook }, main, second, priceE18, pumpUsdE18)
 }
 
-const FAUCET_HINT = 'https://faucet.solana.com'
-
 function printPlan(state: DevnetState, cli: Cli): void {
   const mark = (done: boolean) => (done ? 'done   ' : 'pending')
   console.log('\nplan:')
@@ -978,7 +1095,9 @@ function printPlan(state: DevnetState, cli: Cli): void {
   console.log(`  ${mark(!!state.mints.pump)} mock-PUMP mint (Token-2022, metadata, no hook)`)
   console.log(`  ${mark(!!state.mints.hook)} HOOK-TEST mint (Token-2022, hook authority set, program unset)`)
   console.log(`  ${mark(!!state.distributions['pump:prize'])} PRIZE ← ${fmtTok(cli.prizeSeedRaw)} mock-PUMP`)
-  console.log(`  ${mark(!!state.distributions['hook:prize'])} PRIZE ← ${fmtTok(HOOK_PRIZE_SEED * UNIT)} HOOK-TEST`)
+  console.log(
+    `  ${mark(!!state.distributions['hook:prize'])} PRIZE ← ${fmtTok(HOOK_PRIZE_SEED * UNIT)} HOOK-TEST`,
+  )
   console.log(
     `  ${mark(!!state.distributions['scratchy:trader'] && !!state.distributions['pump:trader'])} TRADER ← ` +
       `${fmtTok(TRADER_INVENTORY.scratchy * UNIT)} mock-SCRATCHY + ${fmtTok(TRADER_INVENTORY.pump * UNIT)} mock-PUMP`,
@@ -992,9 +1111,13 @@ function printPlan(state: DevnetState, cli: Cli): void {
       `${fmtTok(SECOND_SEED.base * UNIT)} / ${fmtTok(SECOND_SEED.quote * UNIT)} (BothToken, static config)`,
   )
   for (const [name, usd] of TEST_WALLETS) {
-    console.log(`  ${mark(!!state.distributions[`scratchy:${name}`])} ${name.toUpperCase()} ← mock-SCRATCHY worth ≈ $${usd}`)
+    console.log(
+      `  ${mark(!!state.distributions[`scratchy:${name}`])} ${name.toUpperCase()} ← mock-SCRATCHY worth ≈ $${usd}`,
+    )
   }
-  console.log(`  pending .env / state files: ${relative(REPO_ROOT, statePath(state.cluster))}, ${relative(REPO_ROOT, envFilePath(state.cluster))}`)
+  console.log(
+    `  then writes ${relative(REPO_ROOT, statePath(state.cluster))} and ${relative(REPO_ROOT, envFilePath(state.cluster))}`,
+  )
 }
 
 function printSummary(
@@ -1021,7 +1144,10 @@ function printSummary(
   console.log(`  mock-PUMP     ${mints.pump.address.padEnd(44)} ${tok(mints.pump.address)}`)
   console.log(`  HOOK-TEST     ${mints.hook.address.padEnd(44)} ${tok(mints.hook.address)}`)
   console.log('pools')
-  for (const [label, p] of [['MAIN', main], ['SECOND', second]] as const) {
+  for (const [label, p] of [
+    ['MAIN', main],
+    ['SECOND', second],
+  ] as const) {
     if (!p) {
       console.log(`  ${label.padEnd(8)} (none)`)
       continue
@@ -1029,8 +1155,12 @@ function printSummary(
     const fee = p.feeBps >= 0 ? `${(p.feeBps / 100).toFixed(2)}%` : 'non-flat fee'
     console.log(`  ${label.padEnd(8)} pool     ${p.address.padEnd(44)} ${acct(p.address)}`)
     console.log(`  ${''.padEnd(8)} position ${p.position.padEnd(44)} ${acct(p.position)}`)
-    console.log(`  ${''.padEnd(8)} NFT      ${p.positionNftMint.padEnd(44)} held by CREATOR ${short(p.owner)}`)
-    console.log(`  ${''.padEnd(8)} ${fee} · ${p.collectFeeMode} · ${p.permanentlyLocked ? 'permanently locked' : 'unlocked'}${p.config ? ` · config ${p.config}` : ''}`)
+    console.log(
+      `  ${''.padEnd(8)} NFT      ${p.positionNftMint.padEnd(44)} held by CREATOR ${short(p.owner)}`,
+    )
+    console.log(
+      `  ${''.padEnd(8)} ${fee} · ${p.collectFeeMode} · ${p.permanentlyLocked ? 'permanently locked' : 'unlocked'}${p.config ? ` · config ${p.config}` : ''}`,
+    )
   }
   console.log(
     `price    1 mock-SCRATCHY = ${formatUnits(priceE18, 18, 6)} mPUMP ≈ ${fmtUsdE18E6(scratchyUsdE18)} ` +
@@ -1040,14 +1170,20 @@ function printSummary(
   for (const [name, usd] of TEST_WALLETS) {
     const raw = BigInt(state.testWallets?.[name]?.scratchyRaw ?? '0')
     const worth = usdE18OfBase(raw, priceE18, pumpUsdE18, DECIMALS)
-    console.log(`  ${name.toUpperCase().padEnd(8)} ${fmtTok(raw).padStart(22)} mock-SCRATCHY ≈ ${fmtUsdE18(worth)} (target $${usd})`)
+    console.log(
+      `  ${name.toUpperCase().padEnd(8)} ${fmtTok(raw).padStart(22)} mock-SCRATCHY ≈ ${fmtUsdE18(worth)} (target $${usd})`,
+    )
   }
   console.log('files')
   console.log(`  ${relative(REPO_ROOT, statePath(c))}   addresses + progress (no secrets)`)
-  console.log(`  ${relative(REPO_ROOT, envFilePath(c))}   API env (0600, gitignored; holds the PRIZE + CREATOR devnet keys)`)
+  console.log(
+    `  ${relative(REPO_ROOT, envFilePath(c))}   API env (0600, gitignored; holds the PRIZE + CREATOR devnet keys)`,
+  )
   console.log('next')
   console.log('  fee inflow:  pnpm --filter @scratchy/api exec tsx scripts/devnet/fee-inflow.ts --count 10')
-  console.log(`  API:         pnpm --filter @scratchy/api exec node --env-file=../../${relative(REPO_ROOT, envFilePath(c))} --import tsx src/main.ts`)
+  console.log(
+    `  API:         pnpm --filter @scratchy/api exec node --env-file=../../${relative(REPO_ROOT, envFilePath(c))} --import tsx src/main.ts`,
+  )
 }
 
 /** USD with 6 decimals (sub-cent token prices) */
@@ -1055,4 +1191,7 @@ function fmtUsdE18E6(usdE18: bigint): string {
   return `$${formatUnits(usdE18, 18, 6)}`
 }
 
-main().catch((e: unknown) => fail(errMessage(e)))
+main().then(
+  () => process.exit(0), // web3.js signature subscriptions can keep the event loop alive
+  (e: unknown) => fail(errMessage(e)),
+)

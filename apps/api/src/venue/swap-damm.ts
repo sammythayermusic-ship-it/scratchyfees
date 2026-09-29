@@ -1,59 +1,35 @@
 import { CpAmm, SwapMode } from '@meteora-ag/cp-amm-sdk'
-import type { Connection, Keypair, PublicKey, Signer, Transaction } from '@solana/web3.js'
+import type { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import BN from 'bn.js'
-import {
-  loadPoolStatics,
-  makeBaseQuoteReader,
-  rpcBalanceReader,
-  type BaseQuoteBalances,
-  type CpAmmLike,
-  type PoolStatics,
-  type TokenBalanceReader,
-} from './damm-v2'
+import { loadPoolStatics, type CpAmmLike, type PoolStatics } from './damm-v2'
 import {
   assertPositiveAmount,
   assertSlippageBps,
   minOutWithSlippage,
-  sendAndConfirmSignedWithSlot,
-  type ConfirmedTx,
+  sendSignedAndConfirm,
+  signWithFreshBlockhash,
+  swapResultFromDeltas,
+  txOwnerTokenDeltas,
+  VenueTxError,
+  type SendOptions,
+  type TxDeltaOptions,
 } from './send'
-import type { SwapAdapter, SwapResult } from './types'
+import type { OnSwapSigned, SwapAdapter, SwapResult } from './types'
 
 /**
  * SCRATCHY → PUMP by swapping directly in the DAMM v2 pool (devnet's swap path; plan "Sweeper": the swap
  * step is exercised with a non-zero SCRATCHY delta on a BothToken devnet pool). Mainnet uses Jupiter.
  *
- * Quote with the SDK's getQuote (base → quote), then swap2 ExactIn. The minimum-out is computed by us from
- * the quote's expected output: floor(out × (10000 − bps) / 10000). (cp-amm-sdk 1.5.0 takes `slippage` in
- * BASIS POINTS — not percent — so we pass bps and don't depend on its rounding either way.)
- * The returned in/out are the owner's measured balance deltas around the confirmed swap.
+ * Quote with the SDK's getQuote (base → quote), then swap2 ExactIn with an explicit minimumAmountOut computed
+ * by us from the quote's expected output: floor(out × (10000 − bps) / 10000) — the same formula as the SDK's
+ * getAmountWithSlippage (cp-amm-sdk 1.5.0 takes `slippage` in BASIS POINTS, not percent), but we don't depend
+ * on its rounding either way.
+ *
+ * SwapAdapter contract: sign → await onSigned → send → confirm. A throwing onSigned means nothing is sent.
+ * From onSigned on, every throw is a VenueTxError carrying the signature (the swap may have landed).
+ * The returned in/out come from the confirmed tx's OWN token-balance meta for the owner (in = −ΔSCRATCHY,
+ * out = +ΔPUMP), and must match what we signed for: in == amountIn, out ≥ minimumAmountOut.
  */
-
-export interface MeasuredSwapSteps {
-  readBalances(minContextSlot?: number): Promise<BaseQuoteBalances>
-  send(): Promise<ConfirmedTx>
-}
-
-/** before → swap → after (pinned to the landing slot); in = SCRATCHY spent, out = PUMP received. */
-export async function runMeasuredSwap(steps: MeasuredSwapSteps): Promise<SwapResult> {
-  const before = await steps.readBalances()
-  const tx = await steps.send()
-  const after = await steps.readBalances(tx.slot)
-  if (after.base.slot < tx.slot || after.quote.slot < tx.slot) {
-    throw new Error(
-      `swap ${tx.signature} landed at slot ${tx.slot} but the balance view is older; re-measure`,
-    )
-  }
-  const inRaw = before.base.value - after.base.value
-  const outRaw = after.quote.value - before.quote.value
-  if (inRaw < 0n || outRaw < 0n) {
-    throw new Error(
-      `swap ${tx.signature}: inconsistent balance deltas (SCRATCHY spent ${inRaw}, PUMP received ${outRaw}) — ` +
-        `concurrent transfer? re-measure`,
-    )
-  }
-  return { signature: tx.signature, inRaw, outRaw }
-}
 
 export interface DammPoolSwapOptions {
   connection: Connection
@@ -66,32 +42,27 @@ export interface DammPoolSwapOptions {
   quoteMint: PublicKey
   /** test seams */
   cpAmm?: CpAmmLike
-  balanceReader?: TokenBalanceReader
-  send?: (tx: Transaction, signers: Signer[]) => Promise<ConfirmedTx>
+  sendOptions?: Omit<SendOptions, 'label'>
+  deltaOptions?: TxDeltaOptions
 }
+
+const LABEL = 'damm-v2 swap2'
 
 export class DammPoolSwap implements SwapAdapter {
   readonly name = 'damm-v2-pool'
   private readonly cpAmm: CpAmmLike
-  private readonly readBalances: (minContextSlot?: number) => Promise<BaseQuoteBalances>
-  private readonly send: (tx: Transaction, signers: Signer[]) => Promise<ConfirmedTx>
   private statics: PoolStatics | null = null
 
   constructor(private readonly o: DammPoolSwapOptions) {
     if (o.baseMint.equals(o.quoteMint)) throw new Error('DammPoolSwap: base and quote mints must differ')
     this.cpAmm = o.cpAmm ?? new CpAmm(o.connection)
-    this.readBalances = makeBaseQuoteReader(
-      o.balanceReader ?? rpcBalanceReader(o.connection),
-      o.owner.publicKey,
-      o.baseMint,
-      o.quoteMint,
-    )
-    this.send =
-      o.send ??
-      ((tx, signers) => sendAndConfirmSignedWithSlot(o.connection, tx, signers, { label: 'damm-v2 swap2' }))
   }
 
-  async swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number): Promise<SwapResult> {
+  async swapBaseToQuote(
+    amountInRaw: bigint,
+    maxSlippageBps: number,
+    onSigned?: OnSwapSigned,
+  ): Promise<SwapResult> {
     assertPositiveAmount(amountInRaw, 'DammPoolSwap')
     assertSlippageBps(maxSlippageBps)
     if (!this.statics) {
@@ -124,29 +95,58 @@ export class DammPoolSwap implements SwapAdapter {
       throw new Error(`DammPoolSwap: quote for ${amountInRaw} SCRATCHY returns no PUMP (pool too shallow?)`)
     }
     const minOut = minOutWithSlippage(expectedOut, maxSlippageBps)
+    if (minOut <= 0n) {
+      throw new Error(
+        `DammPoolSwap: minimum-out for ${amountInRaw} SCRATCHY rounds to 0 PUMP (quoted ${expectedOut}); refusing`,
+      )
+    }
 
-    return runMeasuredSwap({
-      readBalances: (minSlot) => this.readBalances(minSlot),
-      send: async () => {
-        const tx = await this.cpAmm.swap2({
-          payer: this.o.owner.publicKey,
-          pool: this.o.pool,
-          inputTokenMint: this.o.baseMint,
-          outputTokenMint: this.o.quoteMint,
-          tokenAMint: s.tokenAMint,
-          tokenBMint: s.tokenBMint,
-          tokenAVault: s.tokenAVault,
-          tokenBVault: s.tokenBVault,
-          tokenAProgram: s.tokenAProgram,
-          tokenBProgram: s.tokenBProgram,
-          referralTokenAccount: null,
-          poolState,
-          swapMode: SwapMode.ExactIn,
-          amountIn,
-          minimumAmountOut: new BN(minOut.toString()),
-        })
-        return this.send(tx, [this.o.owner])
-      },
+    const tx = await this.cpAmm.swap2({
+      payer: this.o.owner.publicKey,
+      pool: this.o.pool,
+      inputTokenMint: this.o.baseMint,
+      outputTokenMint: this.o.quoteMint,
+      tokenAMint: s.tokenAMint,
+      tokenBMint: s.tokenBMint,
+      tokenAVault: s.tokenAVault,
+      tokenBVault: s.tokenBVault,
+      tokenAProgram: s.tokenAProgram,
+      tokenBProgram: s.tokenBProgram,
+      referralTokenAccount: null,
+      poolState,
+      swapMode: SwapMode.ExactIn,
+      amountIn,
+      minimumAmountOut: new BN(minOut.toString()),
     })
+
+    // 1. sign (nothing sent yet)
+    const signed = await signWithFreshBlockhash(this.o.connection, tx, [this.o.owner], this.o.sendOptions)
+    // 2. hand the signature to the caller; if it can't persist it, nothing is ever broadcast
+    await onSigned?.({ signature: signed.signature, lastValidBlockHeight: signed.lastValidBlockHeight })
+
+    // 3. send + confirm + book from the tx's own meta. Every throw from here on carries the signature.
+    try {
+      await sendSignedAndConfirm(this.o.connection, signed, { ...this.o.sendOptions, label: LABEL })
+      const deltas = await txOwnerTokenDeltas(
+        this.o.connection,
+        signed.signature,
+        this.o.owner.publicKey,
+        this.o.deltaOptions,
+      )
+      return swapResultFromDeltas(signed.signature, deltas, {
+        baseMint: this.o.baseMint.toBase58(),
+        quoteMint: this.o.quoteMint.toBase58(),
+        amountInRaw,
+        minOutRaw: minOut,
+      })
+    } catch (e) {
+      if (e instanceof VenueTxError && e.signature === signed.signature) throw e
+      throw new VenueTxError(
+        `${LABEL} ${signed.signature}: ${(e as Error).message ?? String(e)}; resolve the signature before retrying`,
+        'measurement',
+        signed.signature,
+        e,
+      )
+    }
   }
 }

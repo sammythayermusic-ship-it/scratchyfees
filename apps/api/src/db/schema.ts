@@ -111,6 +111,8 @@ export const entries = pgTable(
     /** §3.2 one scratching session per wallet per round */
     sessionId: text('session_id'),
     lockExpiresAt: ts('lock_expires_at'),
+    /** lock holder's last real action (acquire or reveal) — idle this long → another session may take over */
+    lastScratchAt: ts('last_scratch_at'),
     voidedAt: ts('voided_at'),
     voidReason: text('void_reason'),
   },
@@ -172,6 +174,8 @@ export const payouts = pgTable(
     landedSlot: raw('landed_slot'),
     ataCreated: boolean('ata_created'),
     rebuilds: integer('rebuilds').notNull().default(0),
+    /** consecutive failed simulations (a stuck payout pauses PRIZE payouts + alerts) */
+    simFailures: integer('sim_failures').notNull().default(0),
     nextAttemptAt: ts('next_attempt_at'),
     leaseOwner: text('lease_owner'),
     leaseExpiresAt: ts('lease_expires_at'),
@@ -210,9 +214,13 @@ export const payoutAttempts = pgTable(
     error: text('error'),
     createdAt: ts('created_at').notNull().defaultNow(),
     lastSentAt: ts('last_sent_at'),
+    /** first time an expiry proof saw no status (old attempts need a second, spaced confirmation) */
+    absentSince: ts('absent_since'),
   },
   (t) => [
     uniqueIndex('payout_attempts_sig_uq').on(t.signature),
+    // backstop against two concurrent builders: attempt numbers are unique per payout
+    uniqueIndex('payout_attempts_payout_attempt_uq').on(t.payoutId, t.attempt),
     index('payout_attempts_payout_idx').on(t.payoutId),
   ],
 )
@@ -273,6 +281,12 @@ export const sweeps = pgTable('sweeps', {
     .$type<string[]>()
     .notNull()
     .default(sql`'[]'::jsonb`),
+  /** CREATOR's SCRATCHY before the claim — a sweep may never take CREATOR below it (its own bag) */
+  creatorScratchyBaselineRaw: raw('creator_scratchy_baseline_raw'),
+  /** swap intent persisted before sending: resolved by signature on resume (never re-sold blindly) */
+  swapSig: text('swap_sig'),
+  swapLastValidBlockHeight: raw('swap_last_valid_block_height'),
+  swapIntentInRaw: raw('swap_intent_in_raw'),
   error: text('error'),
   at: ts('at').notNull().defaultNow(),
   updatedAt: ts('updated_at').notNull().defaultNow(),

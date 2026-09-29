@@ -15,7 +15,6 @@ const CREATOR = 'CreatorWa11et111111111111111111111111111111'
 const OPS = 'OpsWa11et111111111111111111111111111111111'
 const PUMP = 'MockPump11111111111111111111111111111111111'
 const SCR = 'MockScratchy111111111111111111111111111111'
-const TRADER = 'Trader1111111111111111111111111111111111111'
 
 class TestAlerter implements Alerter {
   events: AlertEvent[] = []
@@ -28,7 +27,7 @@ class TestAlerter implements Alerter {
 let database: Database
 let chain: MemoryChainClient
 let alerter: TestAlerter
-let gate: { hold: string | null } & PayoutGate
+let gate: { held: { reason: string; hard: boolean } | null } & PayoutGate
 
 function setup(mode: 'OnlyB' | 'BothToken') {
   const venue = new MemoryVenue({
@@ -64,6 +63,7 @@ function setup(mode: 'OnlyB' | 'BothToken') {
     prizeAddress: PRIZE,
     opsAddress: OPS,
     quoteMint: PUMP,
+    baseMint: SCR,
     maxSlippageBps: 300,
   })
   return { venue, swap, worker, sweeper }
@@ -91,11 +91,13 @@ beforeEach(async () => {
   chain.setSol(CREATOR, 1_000_000_000n)
   alerter = new TestAlerter()
   gate = {
-    hold: null,
-    globalHold() {
-      return this.hold
+    held: null,
+    hold() {
+      return this.held
     },
     onBalanceTrouble() {},
+    onStuck() {},
+    onDoublePay() {},
   }
 })
 
@@ -196,11 +198,57 @@ describe('fee sweeper', () => {
 
   it('sweeps keep flowing while prize payouts are held (refilling the pool is what a low-pool pause needs)', async () => {
     const { venue, worker, sweeper } = setup('OnlyB')
-    gate.hold = 'low_pool'
+    gate.held = { reason: 'low_pool', hard: false }
     venue.trade('buy', 1_000_000_000_000n)
     await sweeper.runOnce()
     await deliver(worker)
     await sweeper.runOnce()
     expect((await database.db.select().from(sweeps))[0]!.status).toBe('done')
+  })
+
+  it('a swap that landed but "failed" client-side is resolved from its persisted signature — never sold twice', async () => {
+    const { venue, swap, worker, sweeper } = setup('BothToken')
+    chain.credit(CREATOR, SCR, 777_000_000n)
+    venue.trade('buy', 1_000_000_000_000n)
+    venue.trade('sell', 50_000_000_000_000n)
+    const fees = await venue.pendingFees()
+    swap.landThenThrowNext = 1
+    await sweeper.runOnce()
+    let [s] = await database.db.select().from(sweeps)
+    expect(s!.swapSig).toBeTruthy() // intent persisted before send; the lost response left it unresolved
+    for (let i = 0; i < 3; i++) {
+      await deliver(worker)
+      await sweeper.runOnce()
+    }
+    const all = await database.db.select().from(sweeps).orderBy(sweeps.id)
+    s = all[0]
+    // our own swap pays the pool fee too, so later sweeps claim (and swap) a little more SCRATCHY: one swap per
+    // sweep with SCRATCHY to sell — never a second sale for the first one
+    expect(swap.swaps).toBe(all.filter((r) => r.claimedScratchyRaw > 0n).length)
+    expect(all.reduce((t, r) => t + r.swapInScratchyRaw, 0n)).toBe(
+      all.reduce((t, r) => t + r.claimedScratchyRaw, 0n),
+    )
+    expect(s!.status).toBe('done')
+    expect(s!.swapSig).toBeNull()
+    expect(s!.swapInScratchyRaw).toBe(fees.baseRaw)
+    expect(s!.toPrizeRaw + s!.toOpsRaw).toBe(fees.quoteRaw + s!.swapOutPumpRaw)
+    expect((await chain.getTokenBalance(CREATOR, SCR)).value).toBe(777_000_000n)
+  })
+
+  it("bag guard: a retry never swaps CREATOR's SCRATCHY below its pre-claim balance", async () => {
+    const { venue, swap, worker, sweeper } = setup('BothToken')
+    chain.credit(CREATOR, SCR, 777_000_000n)
+    venue.trade('buy', 1_000_000_000_000n)
+    venue.trade('sell', 50_000_000_000_000n)
+    swap.failNext = 1
+    await sweeper.runOnce()
+    // the claimed SCRATCHY leaves CREATOR before the retry (e.g. moved by hand): nothing left above the baseline
+    const held = (await chain.getTokenBalance(CREATOR, SCR)).value
+    chain.transferExternal(CREATOR, OPS, SCR, held - 777_000_000n)
+    await deliver(worker)
+    await sweeper.runOnce()
+    expect(alerter.events.some((e) => e.kind === 'sweep.bag_guard')).toBe(true)
+    expect(swap.swaps).toBe(0)
+    expect((await chain.getTokenBalance(CREATOR, SCR)).value).toBe(777_000_000n)
   })
 })

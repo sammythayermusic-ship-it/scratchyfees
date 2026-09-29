@@ -11,7 +11,10 @@
     "typecheck": "tsc -p tsconfig.json",
     "db:start": "tsx scripts/db-start.ts",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx scripts/db-migrate.ts"
+    "db:migrate": "tsx scripts/db-migrate.ts",
+    "devnet:setup": "tsx scripts/devnet/setup.ts",
+    "devnet:smoke": "tsx scripts/devnet/smoke.ts",
+    "devnet:fee-inflow": "tsx scripts/devnet/fee-inflow.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",

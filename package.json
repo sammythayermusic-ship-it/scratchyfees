@@ -18,7 +18,10 @@
     "sim": "pnpm --filter @scratchy/core sim",
     "db:start": "pnpm --filter @scratchy/api db:start",
     "brand": "tsx scripts/brand/derive.ts",
-    "sfx": "tsx scripts/sfx/synth.ts"
+    "sfx": "tsx scripts/sfx/synth.ts",
+    "devnet:setup": "pnpm --filter @scratchy/api devnet:setup",
+    "devnet:smoke": "pnpm --filter @scratchy/api devnet:smoke",
+    "devnet:fee-inflow": "pnpm --filter @scratchy/api devnet:fee-inflow"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

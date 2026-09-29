@@ -83,12 +83,16 @@ const schema = z.object({
   PAYOUT_CONCURRENCY: int(4, 1),
   ATA_RECREATE_LIMIT: int(0),
   HOLDINGS_CACHE_SECONDS: int(10),
+  /** CREATOR (fee-claim wallet) SOL floor — alert only */
+  MIN_CREATOR_GAS_SOL: str('0.05'),
 
   // Venue + sweeper
   VENUE: z.enum(['memory', 'damm-v2']).default('memory'),
   VENUE_POOL_ADDRESS: optStr,
   VENUE_POSITION_ADDRESS: optStr,
-  SWAP: z.enum(['none', 'jupiter', 'memory']).default('none'),
+  SWAP: z.enum(['none', 'jupiter', 'damm-v2', 'memory']).default('none'),
+  /** pool used by SWAP=damm-v2 (devnet: the BothToken test pool); defaults to VENUE_POOL_ADDRESS */
+  SWAP_POOL_ADDRESS: optStr,
   SWEEP_MAX_SLIPPAGE_BPS: int(300),
   SWEEPER_ENABLED: bool(true),
 
@@ -115,6 +119,8 @@ const schema = z.object({
   RATE_LIMIT_WALLET_PER_MIN: int(300, 1),
   /** Devnet-only rehearsal helper (forces a jackpot by grinding seeds). Refused on any other cluster. */
   DEV_FORCE_JACKPOT: bool(false),
+  /** the rehearsal wallet whose ticket 0 is ground into a jackpot hit (devnet only) */
+  DEV_FORCE_JACKPOT_WALLET: optStr,
 })
 
 export type RuntimeEnv = z.infer<typeof schema>
@@ -138,6 +144,21 @@ export function loadConfig(source: Record<string, string | undefined> = process.
     throw new Error(
       'SOLANA_CLUSTER=mainnet-beta refused: set ALLOW_MAINNET=yes only as part of the launch checklist',
     )
+  }
+  if (
+    env.SOLANA_CLUSTER === 'mainnet-beta' &&
+    (env.PUMP_MINT !== REAL_PUMP_MINT || env.PUMP_PRICE_MINT !== REAL_PUMP_MINT)
+  ) {
+    throw new Error('on mainnet-beta PUMP_MINT and PUMP_PRICE_MINT must both be the real PUMP mint')
+  }
+  if (env.SOLANA_CLUSTER === 'mainnet-beta' && env.CHAIN_MODE !== 'solana') {
+    throw new Error('mainnet-beta requires CHAIN_MODE=solana')
+  }
+  if (env.SOLANA_CLUSTER === 'mainnet-beta' && env.PRICE_SOURCE !== 'live') {
+    throw new Error('mainnet-beta requires PRICE_SOURCE=live (mock prices would size eligibility wrongly)')
+  }
+  if (env.NODE_ENV === 'production' && env.CHAIN_MODE !== 'solana') {
+    throw new Error('NODE_ENV=production requires CHAIN_MODE=solana (memory mode is for local dev and tests)')
   }
   if (env.DEV_FORCE_JACKPOT && env.SOLANA_CLUSTER === 'mainnet-beta') {
     throw new Error('DEV_FORCE_JACKPOT is devnet/localnet-only')

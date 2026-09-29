@@ -44,8 +44,16 @@ export interface SwapResult {
   outRaw: bigint
 }
 
-/** Swaps claimed SCRATCHY → PUMP (Jupiter on mainnet; pool swap on devnet; no-op under OnlyB). */
+/** Called with the signed swap's signature BEFORE it is sent, so the sweeper can persist a swap intent. */
+export type OnSwapSigned = (signed: { signature: string; lastValidBlockHeight: number }) => Promise<void>
+
+/**
+ * Swaps claimed SCRATCHY → PUMP (Jupiter on mainnet; pool swap on devnet; no-op under OnlyB).
+ * Contract: sign → await onSigned(sig) → send → confirm. The in/out amounts the sweeper books come from the
+ * confirmed tx's own token-balance deltas (ChainClient.getOwnerTokenDeltas), not from balance reads.
+ * A throw after onSigned does NOT mean the swap failed — the sweeper resolves the signature first.
+ */
 export interface SwapAdapter {
   readonly name: string
-  swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number): Promise<SwapResult>
+  swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number, onSigned?: OnSwapSigned): Promise<SwapResult>
 }

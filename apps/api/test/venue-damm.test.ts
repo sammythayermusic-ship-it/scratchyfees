@@ -36,19 +36,29 @@ import {
   sqrtPriceToInversePriceE18,
   sqrtPriceToPriceE18,
   toBaseQuote,
-  type BaseQuoteBalances,
   type CpAmmLike,
-  type TokenBalanceReader,
 } from '../src/venue/damm-v2'
 import {
   minOutWithSlippage,
+  ownerTokenDeltasFromMeta,
   sendAndConfirmSigned,
+  sendSignedAndConfirm,
+  signWithFreshBlockhash,
+  swapResultFromDeltas,
+  txOwnerTokenDeltas,
   VenueTxError,
+  type TxMetaConnection,
   type VenueSendConnection,
 } from '../src/venue/send'
-import { DammPoolSwap, runMeasuredSwap } from '../src/venue/swap-damm'
-import { JupiterSwap, JupiterSwapError, type FetchFn } from '../src/venue/swap-jupiter'
+import { DammPoolSwap } from '../src/venue/swap-damm'
+import {
+  JUPITER_EXPIRY_MARGIN_BLOCKS,
+  JupiterSwap,
+  JupiterSwapError,
+  type FetchFn,
+} from '../src/venue/swap-jupiter'
 import { NoSwap } from '../src/venue/swap-none'
+import type { OnSwapSigned } from '../src/venue/types'
 
 // ── independent big-number reference (decimal.js at 300 significant digits) ───
 // The SDK returns decimal.js instances; clone its constructor with far more precision than it uses (20).
@@ -297,72 +307,234 @@ describe('pending fees and liquidity share', () => {
   })
 })
 
-// ── claim delta math ─────────────────────────────────────────────────────────
+// ── fabricated transaction meta (getTransaction) ─────────────────────────────
 
-function balances(base: bigint, quote: bigint, slot: number): BaseQuoteBalances {
-  return { base: { value: base, slot }, quote: { value: quote, slot } }
+interface Bal {
+  owner: string | undefined
+  mint: string
+  amount: bigint
+  /** defaults to the entry's position; pre/post entries of one account must share it */
+  accountIndex?: number
 }
+
+function tokenBalance(b: Bal, i: number) {
+  return {
+    accountIndex: b.accountIndex ?? i,
+    mint: b.mint,
+    ...(b.owner === undefined ? {} : { owner: b.owner }),
+    programId: TOKEN_PROGRAM_ID.toBase58(),
+    uiTokenAmount: { amount: b.amount.toString(), decimals: 6, uiAmount: null, uiAmountString: '' },
+  }
+}
+
+function txResponse(p: { pre: Bal[]; post: Bal[]; err?: unknown; slot?: number }) {
+  return {
+    slot: p.slot ?? 1,
+    blockTime: null,
+    transaction: { message: {}, signatures: [] },
+    meta: {
+      err: p.err ?? null,
+      fee: 5_000,
+      preBalances: [],
+      postBalances: [],
+      preTokenBalances: p.pre.map(tokenBalance),
+      postTokenBalances: p.post.map(tokenBalance),
+    },
+  }
+}
+
+/** `owner` sells `inRaw` of `base` for `outRaw` of `quote` (quote ATA created in the tx), plus pool noise */
+function swapTxResponse(
+  owner: string,
+  base: string,
+  quote: string,
+  inRaw: bigint,
+  outRaw: bigint,
+  opts: { err?: unknown } = {},
+) {
+  const vaultOwner = Keypair.generate().publicKey.toBase58()
+  return txResponse({
+    pre: [
+      { owner, mint: base, amount: 5_000_000n, accountIndex: 1 },
+      { owner: vaultOwner, mint: base, amount: 7_000_000n, accountIndex: 3 },
+      { owner: vaultOwner, mint: quote, amount: 900_000n, accountIndex: 4 },
+    ],
+    post: [
+      { owner, mint: base, amount: 5_000_000n - inRaw, accountIndex: 1 },
+      { owner, mint: quote, amount: outRaw, accountIndex: 2 },
+      { owner: vaultOwner, mint: base, amount: 7_000_000n + inRaw, accountIndex: 3 },
+      { owner: vaultOwner, mint: quote, amount: 900_000n - outRaw, accountIndex: 4 },
+    ],
+    ...opts,
+  })
+}
+
+const noSleep = async () => {}
+
+// ── tx-meta deltas + swap booking ────────────────────────────────────────────
+
+describe('ownerTokenDeltasFromMeta / txOwnerTokenDeltas', () => {
+  const me = Keypair.generate().publicKey.toBase58()
+  const other = Keypair.generate().publicKey.toBase58()
+  const S = SCRATCHY.toBase58()
+  const P = PUMP.toBase58()
+
+  it('sums post − pre over all of the owner’s accounts per mint and ignores other owners', () => {
+    const d = ownerTokenDeltasFromMeta(
+      txResponse({
+        pre: [
+          { owner: me, mint: S, amount: 1_000n, accountIndex: 1 },
+          { owner: me, mint: P, amount: 70n, accountIndex: 5 }, // closed in the tx (pre only)
+          { owner: other, mint: S, amount: 9_999n, accountIndex: 3 },
+        ],
+        post: [
+          { owner: me, mint: S, amount: 400n, accountIndex: 1 },
+          { owner: me, mint: S, amount: 25n, accountIndex: 2 }, // created in the tx (post only)
+          { owner: other, mint: S, amount: 10_599n, accountIndex: 3 },
+        ],
+      }).meta,
+      me,
+    )
+    expect(d.get(S)).toBe(-575n)
+    expect(d.get(P)).toBe(-70n)
+    expect(d.size).toBe(2)
+  })
+
+  it('refuses a balance entry without an owner (it could be ours)', () => {
+    const meta = txResponse({ pre: [], post: [{ owner: undefined, mint: S, amount: 1n }] }).meta
+    expect(() => ownerTokenDeltasFromMeta(meta, me)).toThrow(/no owner/)
+  })
+
+  it('reads getTransaction(confirmed, v0) and retries while the RPC does not know the tx yet', async () => {
+    const cfgs: unknown[] = []
+    let calls = 0
+    const conn = {
+      getTransaction: async (sig: string, cfg: unknown) => {
+        cfgs.push(cfg)
+        calls++
+        if (calls === 1) throw new Error('503')
+        if (calls === 2) return null
+        expect(sig).toBe('sig-1')
+        return txResponse({ pre: [], post: [{ owner: me, mint: P, amount: 42n }] })
+      },
+    } as unknown as TxMetaConnection
+    const d = await txOwnerTokenDeltas(conn, 'sig-1', new PublicKey(me), { sleep: noSleep })
+    expect(d.get(P)).toBe(42n)
+    expect(calls).toBe(3)
+    expect(cfgs[0]).toEqual({ commitment: 'confirmed', maxSupportedTransactionVersion: 0 })
+  })
+
+  it('throws when the tx never shows up, has no meta, or failed on-chain', async () => {
+    const never = { getTransaction: async () => null } as unknown as TxMetaConnection
+    await expect(txOwnerTokenDeltas(never, 's', me, { attempts: 3, sleep: noSleep })).rejects.toThrow(
+      /not returned by getTransaction after 3 attempts/,
+    )
+    const noMeta = { getTransaction: async () => ({ slot: 1, meta: null }) } as unknown as TxMetaConnection
+    await expect(txOwnerTokenDeltas(noMeta, 's', me, { sleep: noSleep })).rejects.toThrow(/no meta/)
+    const failed = {
+      getTransaction: async () => txResponse({ pre: [], post: [], err: { InstructionError: [0, 'Custom'] } }),
+    } as unknown as TxMetaConnection
+    await expect(txOwnerTokenDeltas(failed, 's', me, { sleep: noSleep })).rejects.toThrow(/failed on-chain/)
+  })
+})
+
+describe('swapResultFromDeltas', () => {
+  const S = SCRATCHY.toBase58()
+  const P = PUMP.toBase58()
+  const want = { baseMint: S, quoteMint: P, amountInRaw: 1_000n, minOutRaw: 90n }
+  const deltas = (base: bigint, quote?: bigint) => {
+    const m = new Map<string, bigint>([[S, base]])
+    if (quote !== undefined) m.set(P, quote)
+    return m
+  }
+
+  it('books in = −Δbase, out = +Δquote when the tx did exactly what was signed', () => {
+    expect(swapResultFromDeltas('sig', deltas(-1_000n, 95n), want)).toEqual({
+      signature: 'sig',
+      inRaw: 1_000n,
+      outRaw: 95n,
+    })
+  })
+
+  it('refuses a different input amount or an output below the signed minimum', () => {
+    expect(() => swapResultFromDeltas('sig', deltas(-999n, 95n), want)).toThrow(/signed for exactly/)
+    expect(() => swapResultFromDeltas('sig', deltas(-1_001n, 95n), want)).toThrow(/signed for exactly/)
+    expect(() => swapResultFromDeltas('sig', deltas(-1_000n, 89n), want)).toThrow(/signed minimum/)
+    expect(() => swapResultFromDeltas('sig', deltas(-1_000n), { ...want, minOutRaw: 0n })).toThrow(
+      /signed minimum/,
+    )
+  })
+})
+
+// ── claim orchestration ──────────────────────────────────────────────────────
 
 describe('runMeasuredClaim', () => {
   it('skips the claim entirely when nothing is pending', async () => {
     let sent = 0
-    let reads = 0
+    let measured = 0
     const r = await runMeasuredClaim({
       pending: async () => ({ quoteRaw: 0n, baseRaw: 0n }),
-      readBalances: async () => {
-        reads++
-        return balances(0n, 0n, 1)
-      },
       sendClaim: async () => {
         sent++
         return { signature: 'x', slot: 1 }
       },
+      claimDeltas: async () => {
+        measured++
+        return { quoteRaw: 1n, baseRaw: 0n }
+      },
     })
     expect(r).toEqual({ signatures: [], claimedQuoteRaw: 0n, claimedBaseRaw: 0n })
     expect(sent).toBe(0)
-    expect(reads).toBe(0)
+    expect(measured).toBe(0)
   })
 
-  it('returns the measured deltas (not the pending estimate) and pins the post-read to the landing slot', async () => {
-    const minSlots: Array<number | undefined> = []
-    let state = balances(500n, 10_000n, 90)
+  it("returns the claim tx's own deltas (not the pending estimate)", async () => {
+    const asked: string[] = []
     const r = await runMeasuredClaim({
       pending: async () => ({ quoteRaw: 9_999n, baseRaw: 0n }), // estimate differs from what lands
-      readBalances: async (min) => {
-        minSlots.push(min)
-        return state
-      },
-      minSlotBefore: 80,
-      sendClaim: async () => {
-        state = balances(500n, 10_000n + 4_321n, 120)
-        return { signature: 'claimSig', slot: 120 }
+      sendClaim: async () => ({ signature: 'claimSig', slot: 120 }),
+      claimDeltas: async (sig) => {
+        asked.push(sig)
+        return { quoteRaw: 4_321n, baseRaw: 0n }
       },
     })
     expect(r).toEqual({ signatures: ['claimSig'], claimedQuoteRaw: 4_321n, claimedBaseRaw: 0n })
-    expect(minSlots).toEqual([80, 120])
+    expect(asked).toEqual(['claimSig'])
   })
 
-  it('throws (with the signature) when a balance dropped across the claim', async () => {
-    let state = balances(500n, 10_000n, 90)
+  it('throws (with the signature) on a negative delta', async () => {
     const p = runMeasuredClaim({
       pending: async () => ({ quoteRaw: 1n, baseRaw: 0n }),
-      readBalances: async () => state,
-      sendClaim: async () => {
-        state = balances(400n, 10_050n, 120)
-        return { signature: 'sigNeg', slot: 120 }
+      sendClaim: async () => ({ signature: 'sigNeg', slot: 120 }),
+      claimDeltas: async () => ({ quoteRaw: 50n, baseRaw: -100n }),
+    })
+    await expect(p).rejects.toBeInstanceOf(ClaimMeasurementError)
+    await expect(p).rejects.toMatchObject({ signatures: ['sigNeg'], signature: 'sigNeg' })
+  })
+
+  it('throws (with the signature) when the claim tx meta cannot be read', async () => {
+    const p = runMeasuredClaim({
+      pending: async () => ({ quoteRaw: 1n, baseRaw: 0n }),
+      sendClaim: async () => ({ signature: 'sigLag', slot: 150 }),
+      claimDeltas: async () => {
+        throw new Error('not returned by getTransaction')
       },
     })
     await expect(p).rejects.toBeInstanceOf(ClaimMeasurementError)
-    await expect(p).rejects.toMatchObject({ signatures: ['sigNeg'] })
+    await expect(p).rejects.toMatchObject({ signatures: ['sigLag'], signature: 'sigLag' })
+    await expect(p).rejects.toThrow(/could not be read/)
   })
 
-  it('refuses a post-claim view older than the landing slot', async () => {
+  it('lets a send failure (which already carries its signature) through unchanged', async () => {
+    const err = new VenueTxError('claim: timeout', 'timeout', 'sigT')
     const p = runMeasuredClaim({
       pending: async () => ({ quoteRaw: 1n, baseRaw: 0n }),
-      readBalances: async () => balances(0n, 5n, 100),
-      sendClaim: async () => ({ signature: 'sigLag', slot: 150 }),
+      sendClaim: async () => {
+        throw err
+      },
+      claimDeltas: async () => ({ quoteRaw: 1n, baseRaw: 0n }),
     })
-    await expect(p).rejects.toThrow(/older/)
+    await expect(p).rejects.toBe(err)
   })
 })
 
@@ -408,8 +580,7 @@ interface VenueFixture {
   nftAccount: PublicKey
   poolState: DammPoolState
   claimCalls: Array<Record<string, unknown>>
-  bal: Map<string, bigint>
-  readMinSlots: Array<number | undefined>
+  txLookups: Array<{ sig: string; cfg: unknown }>
 }
 
 function venueFixture(opts: {
@@ -419,6 +590,8 @@ function venueFixture(opts: {
   positionPool?: PublicKey
   /** the NFT was moved out of the PDA account into another CREATOR account */
   nftMoved?: boolean
+  /** override what the claim tx's meta shows for CREATOR (default: the pending PUMP arrives) */
+  claimMeta?: (creator: string) => { pre: Bal[]; post: Bal[] } | null
 }): VenueFixture {
   const creator = Keypair.generate()
   const pool = Keypair.generate().publicKey
@@ -462,6 +635,24 @@ function venueFixture(opts: {
       tokenAccount(nftMint, opts.nftHolder ?? creator.publicKey, 1n, TOKEN_2022_PROGRAM_ID),
     ],
   ])
+  const quotePending = opts.inverted ? (opts.pending?.a ?? 0n) : (opts.pending?.b ?? 0n)
+  const me = creator.publicKey.toBase58()
+  const authority = derivePoolAuthority().toBase58()
+  const defaultMeta = (): { pre: Bal[]; post: Bal[] } => ({
+    // CREATOR's PUMP account + the pool's PUMP vault; SCRATCHY untouched (OnlyB)
+    pre: [
+      { owner: me, mint: PUMP.toBase58(), amount: 50_000n, accountIndex: 1 },
+      { owner: me, mint: SCRATCHY.toBase58(), amount: 1_000n, accountIndex: 2 },
+      { owner: authority, mint: PUMP.toBase58(), amount: 222_000n, accountIndex: 3 },
+    ],
+    post: [
+      { owner: me, mint: PUMP.toBase58(), amount: 50_000n + quotePending, accountIndex: 1 },
+      { owner: me, mint: SCRATCHY.toBase58(), amount: 1_000n, accountIndex: 2 },
+      { owner: authority, mint: PUMP.toBase58(), amount: 222_000n - quotePending, accountIndex: 3 },
+    ],
+  })
+  const txLookups: Array<{ sig: string; cfg: unknown }> = []
+  // no getTokenAccountsByOwner / balance reads on purpose: the claim must be measured from its tx meta
   const connection = {
     getAccountInfo: async (k: PublicKey) => accounts.get(k.toBase58()) ?? null,
     getMultipleAccountsInfoAndContext: async (keys: PublicKey[]) => ({
@@ -470,6 +661,12 @@ function venueFixture(opts: {
         tokenAccount(PUMP, pool, vaultAmounts.get(k.toBase58()) ?? 0n, TOKEN_PROGRAM_ID),
       ),
     }),
+    getTransaction: async (sig: string, cfg: unknown) => {
+      txLookups.push({ sig, cfg })
+      if (sig !== 'claim-1') return null
+      const m = opts.claimMeta ? opts.claimMeta(me) : defaultMeta()
+      return m ? txResponse(m) : null
+    },
   } as unknown as Connection
   const claimCalls: Array<Record<string, unknown>> = []
   const cpAmm = {
@@ -482,17 +679,6 @@ function venueFixture(opts: {
       return new Transaction()
     },
   } as unknown as CpAmmLike
-  const bal = new Map<string, bigint>([
-    [SCRATCHY.toBase58(), 1_000n],
-    [PUMP.toBase58(), 50_000n],
-  ])
-  const readMinSlots: Array<number | undefined> = []
-  let slot = 10
-  const balanceReader: TokenBalanceReader = async (owner, mint, min) => {
-    expect(owner.equals(creator.publicKey)).toBe(true)
-    readMinSlots.push(min)
-    return { value: bal.get(mint.toBase58()) ?? 0n, slot: Math.max(slot, min ?? 0) }
-  }
   const venue = new DammV2Venue({
     connection,
     creator,
@@ -501,17 +687,13 @@ function venueFixture(opts: {
     baseMint: SCRATCHY,
     quoteMint: PUMP,
     cpAmm,
-    balanceReader,
+    deltaOptions: { attempts: 3, sleep: noSleep },
     send: async (_tx, signers) => {
       expect(signers).toEqual([creator])
-      // the claim lands: fees arrive in CREATOR (OnlyB → PUMP only)
-      const quotePending = opts.inverted ? (opts.pending?.a ?? 0n) : (opts.pending?.b ?? 0n)
-      bal.set(PUMP.toBase58(), bal.get(PUMP.toBase58())! + quotePending)
-      slot = 777
       return { signature: 'claim-1', slot: 777 }
     },
   })
-  return { venue, creator, pool, position, nftMint, nftAccount, poolState, claimCalls, bal, readMinSlots }
+  return { venue, creator, pool, position, nftMint, nftAccount, poolState, claimCalls, txLookups }
 }
 
 describe('DammV2Venue (faked SDK + RPC)', () => {
@@ -561,7 +743,7 @@ describe('DammV2Venue (faked SDK + RPC)', () => {
     expect(await f.venue.creatorLiquidityShare()).toBe(0.25) // (1 + 2 + 7) / 40
   })
 
-  it('claims with claimPositionFee2 and returns the measured PUMP delta', async () => {
+  it("claims with claimPositionFee2 and books the PUMP delta from the claim tx's own meta", async () => {
     const f = venueFixture({ pending: { a: 0n, b: 9_876n } })
     expect(await f.venue.pendingFees()).toEqual({ quoteRaw: 9_876n, baseRaw: 0n })
     const r = await f.venue.claimFees()
@@ -574,8 +756,27 @@ describe('DammV2Venue (faked SDK + RPC)', () => {
     expect((c.positionNftAccount as PublicKey).equals(derivePositionNftAccount(f.nftMint))).toBe(true)
     expect((c.tokenAProgram as PublicKey).equals(TOKEN_PROGRAM_ID)).toBe(true)
     expect((c.tokenBProgram as PublicKey).equals(TOKEN_2022_PROGRAM_ID)).toBe(true)
-    // pre-read (no lower bound yet) ×2 mints, post-read pinned to the landing slot ×2
-    expect(f.readMinSlots).toEqual([undefined, undefined, 777, 777])
+    expect(f.txLookups).toEqual([
+      { sig: 'claim-1', cfg: { commitment: 'confirmed', maxSupportedTransactionVersion: 0 } },
+    ])
+  })
+
+  it('books the measured amount even when it differs from the pending estimate', async () => {
+    const f = venueFixture({
+      pending: { a: 0n, b: 9_876n },
+      claimMeta: (me) => ({
+        pre: [{ owner: me, mint: PUMP.toBase58(), amount: 10n }],
+        post: [
+          { owner: me, mint: PUMP.toBase58(), amount: 10n + 9_000n, accountIndex: 0 },
+          { owner: me, mint: SCRATCHY.toBase58(), amount: 3n, accountIndex: 1 }, // SCRATCHY ATA created
+        ],
+      }),
+    })
+    expect(await f.venue.claimFees()).toEqual({
+      signatures: ['claim-1'],
+      claimedQuoteRaw: 9_000n,
+      claimedBaseRaw: 3n,
+    })
   })
 
   it('maps fees correctly for an inverted pool', async () => {
@@ -592,10 +793,32 @@ describe('DammV2Venue (faked SDK + RPC)', () => {
     expect((f.claimCalls[0]!.positionNftAccount as PublicKey).equals(f.nftAccount)).toBe(true)
   })
 
-  it('does not send anything when nothing is pending', async () => {
+  it('does not send (or look anything up) when nothing is pending', async () => {
     const f = venueFixture({})
     expect(await f.venue.claimFees()).toEqual({ signatures: [], claimedQuoteRaw: 0n, claimedBaseRaw: 0n })
     expect(f.claimCalls).toHaveLength(0)
+    expect(f.txLookups).toHaveLength(0)
+  })
+
+  it('throws with the claim signature on a negative delta or when the claim tx meta never shows up', async () => {
+    const neg = venueFixture({
+      pending: { a: 0n, b: 5n },
+      claimMeta: (me) => ({
+        pre: [{ owner: me, mint: PUMP.toBase58(), amount: 100n }],
+        post: [{ owner: me, mint: PUMP.toBase58(), amount: 90n }],
+      }),
+    })
+    await expect(neg.venue.claimFees()).rejects.toMatchObject({
+      name: 'ClaimMeasurementError',
+      signatures: ['claim-1'],
+      signature: 'claim-1',
+    })
+    const missing = venueFixture({ pending: { a: 0n, b: 5n }, claimMeta: () => null })
+    await expect(missing.venue.claimFees()).rejects.toMatchObject({
+      name: 'ClaimMeasurementError',
+      signature: 'claim-1',
+    })
+    expect(missing.txLookups).toHaveLength(3) // retried per deltaOptions.attempts
   })
 
   it('refuses a position from another pool or whose NFT CREATOR does not hold', async () => {
@@ -608,78 +831,152 @@ describe('DammV2Venue (faked SDK + RPC)', () => {
   })
 })
 
+// ── fake RPC for sign → send → confirm → getTransaction ──────────────────────
+
+type Status = { slot: number; err: unknown; confirmationStatus: string } | null
+
+function fakeRpc(p: {
+  /** successive non-history status answers (the last one repeats); default: confirmed at slot 7 */
+  statuses?: Status[]
+  history?: Status
+  historyContextSlot?: number
+  finalizedHeight?: number
+  finalizedSlot?: number
+  sendThrows?: Error
+  /** getTransaction answer for a signature */
+  tx?: (sig: string, call: number) => unknown
+  events?: string[]
+  accounts?: Map<string, AccountInfo<Buffer>>
+}) {
+  const sends: Array<{ raw: Uint8Array; skipPreflight?: boolean }> = []
+  const events = p.events ?? []
+  let i = 0
+  let txCalls = 0
+  const statuses = p.statuses ?? [{ slot: 7, err: null, confirmationStatus: 'confirmed' }]
+  const conn = {
+    getLatestBlockhash: async () => ({
+      blockhash: bs58.encode(Buffer.alloc(32, 9)),
+      lastValidBlockHeight: 100,
+    }),
+    sendRawTransaction: async (raw: Uint8Array, o?: { skipPreflight?: boolean }) => {
+      events.push('send')
+      sends.push({ raw: Uint8Array.from(raw), skipPreflight: o?.skipPreflight })
+      if (p.sendThrows && sends.length === 1) throw p.sendThrows
+      return 'ignored'
+    },
+    getSignatureStatuses: async (_sigs: string[], cfg?: { searchTransactionHistory?: boolean }) =>
+      cfg?.searchTransactionHistory
+        ? { context: { slot: p.historyContextSlot ?? 1 }, value: [p.history ?? null] }
+        : { context: { slot: 1 }, value: [statuses[Math.min(i++, statuses.length - 1)] ?? null] },
+    getEpochInfo: async () => ({
+      epoch: 1,
+      slotIndex: 0,
+      slotsInEpoch: 432_000,
+      absoluteSlot: p.finalizedSlot ?? 1,
+      blockHeight: p.finalizedHeight ?? 50,
+    }),
+    getTransaction: async (sig: string) => {
+      events.push('getTransaction')
+      return p.tx ? (p.tx(sig, ++txCalls) ?? null) : null
+    },
+    getSlot: async () => 1_000,
+    getBlockTime: async () => 1_700_000_000,
+    getAccountInfo: async (k: PublicKey) => p.accounts?.get(k.toBase58()) ?? null,
+  }
+  return { conn: conn as unknown as Connection & VenueSendConnection, sends, events }
+}
+
+const firstSig = (raw: Uint8Array) => bs58.encode(Transaction.from(raw).signature!)
+
 // ── DAMM pool swap ───────────────────────────────────────────────────────────
 
-describe('DammPoolSwap', () => {
-  it('quotes base→quote with slippage in bps, swaps ExactIn with our own floor, returns measured deltas', async () => {
-    const owner = Keypair.generate()
-    const pool = Keypair.generate().publicKey
-    const poolState = fakePoolState(
-      {
-        tokenAMint: SCRATCHY,
-        tokenBMint: PUMP,
-        tokenAFlag: 1,
-        tokenBFlag: 1,
-        sqrtPrice: X64,
-        liquidity: X64,
-      },
-      pool,
-    )
-    const accounts = new Map([
-      [SCRATCHY.toBase58(), mintAccount(6, TOKEN_2022_PROGRAM_ID)],
-      [PUMP.toBase58(), mintAccount(6, TOKEN_2022_PROGRAM_ID)],
-    ])
-    const connection = {
-      getAccountInfo: async (k: PublicKey) => accounts.get(k.toBase58()) ?? null,
-      getSlot: async () => 1_000,
-      getBlockTime: async () => 1_700_000_000,
-    } as unknown as Connection
-    const quoteCalls: Array<Record<string, unknown>> = []
-    const swapCalls: Array<Record<string, unknown>> = []
-    const cpAmm = {
-      fetchPoolState: async () => poolState,
-      getQuote: (p: Record<string, unknown>) => {
-        quoteCalls.push(p)
-        return { swapOutAmount: new BN(99_999), minSwapOutAmount: new BN(0) }
-      },
-      swap2: async (p: Record<string, unknown>) => {
-        swapCalls.push(p)
-        return new Transaction()
-      },
-    } as unknown as CpAmmLike
-    const bal = new Map([
-      [SCRATCHY.toBase58(), 5_000_000n],
-      [PUMP.toBase58(), 0n],
-    ])
-    let slot = 5
-    const swap = new DammPoolSwap({
-      connection,
-      owner,
-      pool,
-      baseMint: SCRATCHY,
-      quoteMint: PUMP,
-      cpAmm,
-      balanceReader: async (_o, mint, min) => ({
-        value: bal.get(mint.toBase58())!,
-        slot: Math.max(slot, min ?? 0),
-      }),
-      send: async () => {
-        bal.set(SCRATCHY.toBase58(), 4_000_000n)
-        bal.set(PUMP.toBase58(), 99_990n)
-        slot = 1_001
-        return { signature: 'swap-1', slot: 1_001 }
-      },
-    })
-    await expect(swap.swapBaseToQuote(0n, 300)).rejects.toThrow(/> 0/)
-    await expect(swap.swapBaseToQuote(-5n, 300)).rejects.toThrow(/> 0/)
-    await expect(swap.swapBaseToQuote(1n, 10_000)).rejects.toThrow(/maxSlippageBps/)
+function dammSwapHarness(p: {
+  /** swap tx meta as a function of the signature; default: exactly 1_000_000 in, 99_990 out */
+  tx?: (sig: string, call: number) => unknown
+  statuses?: Status[]
+  sendThrows?: Error
+  quoteOut?: number
+}) {
+  const owner = Keypair.generate()
+  const pool = Keypair.generate().publicKey
+  const poolState = fakePoolState(
+    {
+      tokenAMint: SCRATCHY,
+      tokenBMint: PUMP,
+      tokenAFlag: 1,
+      tokenBFlag: 1,
+      sqrtPrice: X64,
+      liquidity: X64,
+    },
+    pool,
+  )
+  const accounts = new Map([
+    [SCRATCHY.toBase58(), mintAccount(6, TOKEN_2022_PROGRAM_ID)],
+    [PUMP.toBase58(), mintAccount(6, TOKEN_2022_PROGRAM_ID)],
+  ])
+  const events: string[] = []
+  const me = owner.publicKey.toBase58()
+  const rpc = fakeRpc({
+    events,
+    accounts,
+    statuses: p.statuses,
+    sendThrows: p.sendThrows,
+    tx: p.tx ?? (() => swapTxResponse(me, SCRATCHY.toBase58(), PUMP.toBase58(), 1_000_000n, 99_990n)),
+  })
+  const quoteCalls: Array<Record<string, unknown>> = []
+  const swapCalls: Array<Record<string, unknown>> = []
+  const cpAmm = {
+    fetchPoolState: async () => poolState,
+    getQuote: (q: Record<string, unknown>) => {
+      quoteCalls.push(q)
+      return { swapOutAmount: new BN(p.quoteOut ?? 99_999), minSwapOutAmount: new BN(0) }
+    },
+    swap2: async (s: Record<string, unknown>) => {
+      swapCalls.push(s)
+      return new Transaction().add(
+        SystemProgram.transfer({ fromPubkey: owner.publicKey, toPubkey: pool, lamports: 1 }),
+      )
+    },
+  } as unknown as CpAmmLike
+  const swap = new DammPoolSwap({
+    connection: rpc.conn,
+    owner,
+    pool,
+    baseMint: SCRATCHY,
+    quoteMint: PUMP,
+    cpAmm,
+    sendOptions: { sleep: noSleep, pollMs: 0, resendMs: 0 },
+    deltaOptions: { attempts: 3, sleep: noSleep },
+  })
+  const signedCalls: Array<{ signature: string; lastValidBlockHeight: number }> = []
+  const onSigned: OnSwapSigned = async (s) => {
+    events.push('onSigned')
+    signedCalls.push(s)
+  }
+  return { swap, owner, rpc, events, quoteCalls, swapCalls, onSigned, signedCalls, me }
+}
 
-    const r = await swap.swapBaseToQuote(1_000_000n, 300)
-    expect(r).toEqual({ signature: 'swap-1', inRaw: 1_000_000n, outRaw: 99_990n })
-    expect(quoteCalls[0]!.slippage).toBe(300) // SDK 1.5.0 takes basis points
-    expect((quoteCalls[0]!.inputTokenMint as PublicKey).equals(SCRATCHY)).toBe(true)
-    expect(quoteCalls[0]!.currentSlot).toBe(1_000)
-    const s = swapCalls[0]!
+describe('DammPoolSwap', () => {
+  it('quotes in bps, swaps ExactIn with our floor, signs → onSigned → sends, books in/out from tx meta', async () => {
+    const h = dammSwapHarness({})
+    await expect(h.swap.swapBaseToQuote(0n, 300)).rejects.toThrow(/> 0/)
+    await expect(h.swap.swapBaseToQuote(-5n, 300)).rejects.toThrow(/> 0/)
+    await expect(h.swap.swapBaseToQuote(1n, 10_000)).rejects.toThrow(/maxSlippageBps/)
+
+    const r = await h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    const sig = h.signedCalls[0]!.signature
+    expect(r).toEqual({ signature: sig, inRaw: 1_000_000n, outRaw: 99_990n })
+    // the signature handed to onSigned is the one broadcast, and nothing was broadcast before it
+    expect(h.events.slice(0, 2)).toEqual(['onSigned', 'send'])
+    expect(h.signedCalls).toEqual([{ signature: sig, lastValidBlockHeight: 100 }])
+    expect(h.rpc.sends.length).toBeGreaterThan(0)
+    for (const s of h.rpc.sends) expect(firstSig(s.raw)).toBe(sig) // identical bytes on every broadcast
+    expect(h.rpc.sends[0]!.skipPreflight).toBe(false)
+
+    expect(h.quoteCalls[0]!.slippage).toBe(300) // SDK 1.5.0 takes basis points
+    expect((h.quoteCalls[0]!.inputTokenMint as PublicKey).equals(SCRATCHY)).toBe(true)
+    expect(h.quoteCalls[0]!.currentSlot).toBe(1_000)
+    const s = h.swapCalls[0]!
     expect((s.inputTokenMint as PublicKey).equals(SCRATCHY)).toBe(true)
     expect((s.outputTokenMint as PublicKey).equals(PUMP)).toBe(true)
     expect(s.swapMode).toBe(0) // ExactIn
@@ -687,28 +984,105 @@ describe('DammPoolSwap', () => {
     expect((s.minimumAmountOut as BN).toString()).toBe('96999') // floor(99_999 × 0.97)
   })
 
-  it('runMeasuredSwap rejects inconsistent deltas', async () => {
-    let st = balances(100n, 0n, 1)
+  it('works without onSigned (optional)', async () => {
+    const h = dammSwapHarness({})
+    expect(await h.swap.swapBaseToQuote(1_000_000n, 300)).toMatchObject({
+      inRaw: 1_000_000n,
+      outRaw: 99_990n,
+    })
+  })
+
+  it('never sends when onSigned throws', async () => {
+    const h = dammSwapHarness({})
+    const boom = new Error('db down')
     await expect(
-      runMeasuredSwap({
-        readBalances: async () => st,
-        send: async () => {
-          st = balances(150n, 10n, 2)
-          return { signature: 's', slot: 2 }
-        },
+      h.swap.swapBaseToQuote(1_000_000n, 300, async () => {
+        throw boom
       }),
-    ).rejects.toThrow(/inconsistent/)
+    ).rejects.toBe(boom)
+    expect(h.rpc.sends).toHaveLength(0)
+    expect(h.events).not.toContain('send')
+  })
+
+  it('an on-chain failure after sending carries the signature', async () => {
+    const h = dammSwapHarness({
+      statuses: [
+        { slot: 9, err: { InstructionError: [2, { Custom: 6004 }] }, confirmationStatus: 'confirmed' },
+      ],
+    })
+    const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    await expect(p).rejects.toBeInstanceOf(VenueTxError)
+    await expect(p).rejects.toMatchObject({ failure: 'onchain', signature: h.signedCalls[0]?.signature })
+  })
+
+  it('a preflight rejection carries the signature too (it may exist on another node)', async () => {
+    const h = dammSwapHarness({
+      sendThrows: new SendTransactionError({
+        action: 'send',
+        signature: 'x',
+        transactionMessage: 'Blockhash not found',
+        logs: [],
+      }),
+    })
+    const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    await expect(p).rejects.toMatchObject({ failure: 'preflight' })
+    await expect(p).rejects.toMatchObject({ signature: h.signedCalls[0]!.signature })
+  })
+
+  it('refuses to book a tx whose meta differs from what was signed (with the signature)', async () => {
+    for (const [inRaw, outRaw, re] of [
+      [900_000n, 99_990n, /signed for exactly/],
+      [1_000_000n, 96_998n, /signed minimum/],
+    ] as const) {
+      const h = dammSwapHarness({
+        tx: () => swapTxResponse(h.me, SCRATCHY.toBase58(), PUMP.toBase58(), inRaw, outRaw),
+      })
+      const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+      await expect(p).rejects.toThrow(re)
+      await expect(p).rejects.toMatchObject({
+        failure: 'measurement',
+        signature: h.signedCalls[0]!.signature,
+      })
+    }
+  })
+
+  it('retries a lagging getTransaction and throws with the signature if the tx never shows up', async () => {
+    const lag = dammSwapHarness({
+      tx: (_sig, call) =>
+        call < 3 ? null : swapTxResponse(lag.me, SCRATCHY.toBase58(), PUMP.toBase58(), 1_000_000n, 99_990n),
+    })
+    expect(await lag.swap.swapBaseToQuote(1_000_000n, 300)).toMatchObject({ outRaw: 99_990n })
+
+    const never = dammSwapHarness({ tx: () => null })
+    const p = never.swap.swapBaseToQuote(1_000_000n, 300, never.onSigned)
+    await expect(p).rejects.toThrow(/not returned by getTransaction/)
+    await expect(p).rejects.toMatchObject({
+      failure: 'measurement',
+      signature: never.signedCalls[0]!.signature,
+    })
+  })
+
+  it('refuses a quote whose slippage floor rounds to zero, before signing', async () => {
+    const h = dammSwapHarness({ quoteOut: 1 })
+    await expect(h.swap.swapBaseToQuote(10n, 300, h.onSigned)).rejects.toThrow(/rounds to 0/)
+    expect(h.signedCalls).toHaveLength(0)
+    expect(h.rpc.sends).toHaveLength(0)
   })
 })
 
 // ── NoSwap + slippage math ───────────────────────────────────────────────────
 
 describe('NoSwap', () => {
-  it('returns zeros for 0 and refuses any real amount', async () => {
+  it('returns zeros for 0 and refuses any real amount, never calling onSigned', async () => {
     const n = new NoSwap()
+    let signed = 0
+    const onSigned: OnSwapSigned = async () => {
+      signed++
+    }
     expect(n.name).toBe('none')
-    expect(await n.swapBaseToQuote(0n, 300)).toEqual({ signature: '', inRaw: 0n, outRaw: 0n })
-    await expect(n.swapBaseToQuote(1n, 300)).rejects.toThrow(/OnlyB/)
+    expect(await n.swapBaseToQuote(0n, 300, onSigned)).toEqual({ signature: '', inRaw: 0n, outRaw: 0n })
+    await expect(n.swapBaseToQuote(1n, 300, onSigned)).rejects.toThrow(/OnlyB/)
+    expect(signed).toBe(0)
   })
 })
 
@@ -728,12 +1102,16 @@ describe('minOutWithSlippage', () => {
 const JUP_IN = SCRATCHY.toBase58()
 const JUP_OUT = PUMP.toBase58()
 
-function unsignedV0(payer: PublicKey): string {
+function unsignedV0(payer: PublicKey, extraSigner?: PublicKey): string {
   const msg = new TransactionMessage({
     payerKey: payer,
     recentBlockhash: bs58.encode(Buffer.alloc(32, 7)),
     instructions: [
-      SystemProgram.transfer({ fromPubkey: payer, toPubkey: Keypair.generate().publicKey, lamports: 1 }),
+      SystemProgram.transfer({
+        fromPubkey: extraSigner ?? payer,
+        toPubkey: Keypair.generate().publicKey,
+        lamports: 1,
+      }),
     ],
   }).compileToV0Message()
   return Buffer.from(new VersionedTransaction(msg).serialize()).toString('base64')
@@ -750,10 +1128,15 @@ function jupiterHarness(p: {
   order?: Record<string, unknown> | ((owner: Keypair) => Record<string, unknown>)
   orderStatus?: number
   execute?: (signedTx: VersionedTransaction) => Record<string, unknown>
+  executeStatus?: number
   rpcStatus?: { err: unknown; confirmationStatus: string } | null
+  /** swap tx meta (default: exactly 1_000_000 SCRATCHY in, 49_876 PUMP out) */
+  tx?: (owner: string) => unknown
+  blockhashThrows?: boolean
 }) {
   const owner = p.owner ?? Keypair.generate()
   const calls: Call[] = []
+  const events: string[] = []
   const defaultOrder = {
     transaction: unsignedV0(owner.publicKey),
     requestId: 'req-1',
@@ -764,6 +1147,7 @@ function jupiterHarness(p: {
     otherAmountThreshold: '48500',
     swapMode: 'ExactIn',
     slippageBps: 300,
+    gasless: false,
   }
   const fetchImpl: FetchFn = async (url, init) => {
     calls.push({ url, init })
@@ -771,6 +1155,7 @@ function jupiterHarness(p: {
       const o = typeof p.order === 'function' ? p.order(owner) : { ...defaultOrder, ...(p.order ?? {}) }
       return new Response(JSON.stringify(o), { status: p.orderStatus ?? 200 })
     }
+    events.push('execute')
     const body = JSON.parse(String(init?.body)) as { signedTransaction: string }
     const tx = VersionedTransaction.deserialize(Buffer.from(body.signedTransaction, 'base64'))
     const res = p.execute
@@ -778,11 +1163,14 @@ function jupiterHarness(p: {
       : {
           status: 'Success',
           signature: bs58.encode(tx.signatures[0]!),
-          totalInputAmount: '1000000',
-          totalOutputAmount: '49876',
+          // deliberately wrong: in/out must come from the tx meta, never from execute's totals
+          totalInputAmount: '1',
+          totalOutputAmount: '999999999',
         }
-    return new Response(JSON.stringify(res), { status: 200 })
+    return new Response(JSON.stringify(res), { status: p.executeStatus ?? 200 })
   }
+  const me = owner.publicKey.toBase58()
+  const txLookups: string[] = []
   const connection = {
     getSignatureStatuses: async () => ({
       context: { slot: 1 },
@@ -792,6 +1180,14 @@ function jupiterHarness(p: {
           : p.rpcStatus,
       ],
     }),
+    getLatestBlockhash: async () => {
+      if (p.blockhashThrows) throw new Error('rpc down')
+      return { blockhash: bs58.encode(Buffer.alloc(32, 3)), lastValidBlockHeight: 1_000 }
+    },
+    getTransaction: async (sig: string) => {
+      txLookups.push(sig)
+      return p.tx ? p.tx(me) : swapTxResponse(me, JUP_IN, JUP_OUT, 1_000_000n, 49_876n)
+    },
   } as unknown as Connection
   const swap = new JupiterSwap({
     connection,
@@ -802,15 +1198,21 @@ function jupiterHarness(p: {
     inputMint: JUP_IN,
     outputMint: JUP_OUT,
     confirmPolls: 3,
-    sleep: async () => {},
+    sleep: noSleep,
+    deltaOptions: { attempts: 2, sleep: noSleep },
   })
-  return { swap, calls, owner, defaultOrder }
+  const signedCalls: Array<{ signature: string; lastValidBlockHeight: number }> = []
+  const onSigned: OnSwapSigned = async (s) => {
+    events.push('onSigned')
+    signedCalls.push(s)
+  }
+  return { swap, calls, owner, defaultOrder, events, onSigned, signedCalls, txLookups }
 }
 
 describe('JupiterSwap', () => {
-  it('builds /order with explicit slippageBps + taker, signs as taker, posts /execute, returns execute totals', async () => {
+  it('builds /order with explicit slippageBps + taker, signs → onSigned → /execute, books from tx meta', async () => {
     const h = jupiterHarness({ apiKey: 'secret-key' })
-    const r = await h.swap.swapBaseToQuote(1_000_000n, 300)
+    const r = await h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
     expect(h.calls).toHaveLength(2)
 
     const order = new URL(h.calls[0]!.url)
@@ -834,10 +1236,47 @@ describe('JupiterSwap', () => {
     // ed25519 is deterministic: re-signing the unsigned order tx must reproduce the posted signature
     const expected = VersionedTransaction.deserialize(Buffer.from(h.defaultOrder.transaction, 'base64'))
     expected.sign([h.owner])
+    const sig = bs58.encode(expected.signatures[0]!)
     const posted = VersionedTransaction.deserialize(Buffer.from(body.signedTransaction, 'base64'))
-    expect(bs58.encode(posted.signatures[0]!)).toBe(bs58.encode(expected.signatures[0]!))
+    expect(bs58.encode(posted.signatures[0]!)).toBe(sig)
 
-    expect(r).toEqual({ signature: bs58.encode(expected.signatures[0]!), inRaw: 1_000_000n, outRaw: 49_876n })
+    // onSigned got OUR signature (= the tx id) before anything was executed
+    expect(h.events).toEqual(['onSigned', 'execute'])
+    expect(h.signedCalls).toEqual([
+      { signature: sig, lastValidBlockHeight: 1_000 + JUPITER_EXPIRY_MARGIN_BLOCKS },
+    ])
+    // in/out from the confirmed tx's meta, not execute's (bogus) totals
+    expect(r).toEqual({ signature: sig, inRaw: 1_000_000n, outRaw: 49_876n })
+    expect(h.txLookups).toEqual([sig])
+  })
+
+  it("uses the order's own lastValidBlockHeight when it is later, and refuses when none is known", async () => {
+    const later = jupiterHarness({ order: { lastValidBlockHeight: 5_000 } })
+    await later.swap.swapBaseToQuote(1_000_000n, 300, later.onSigned)
+    expect(later.signedCalls[0]!.lastValidBlockHeight).toBe(5_000)
+
+    const orderOnly = jupiterHarness({ order: { lastValidBlockHeight: '777' }, blockhashThrows: true })
+    await orderOnly.swap.swapBaseToQuote(1_000_000n, 300, orderOnly.onSigned)
+    expect(orderOnly.signedCalls[0]!.lastValidBlockHeight).toBe(777)
+
+    const none = jupiterHarness({ blockhashThrows: true })
+    await expect(none.swap.swapBaseToQuote(1_000_000n, 300, none.onSigned)).rejects.toThrow(
+      /lastValidBlockHeight/,
+    )
+    expect(none.signedCalls).toHaveLength(0)
+    expect(none.calls).toHaveLength(1) // /execute never reached
+  })
+
+  it('never calls /execute when onSigned throws', async () => {
+    const h = jupiterHarness({})
+    const boom = new Error('db down')
+    await expect(
+      h.swap.swapBaseToQuote(1_000_000n, 300, async () => {
+        throw boom
+      }),
+    ).rejects.toBe(boom)
+    expect(h.calls).toHaveLength(1)
+    expect(h.events).toEqual([])
   })
 
   it('sends no x-api-key header without a key', async () => {
@@ -870,12 +1309,19 @@ describe('JupiterSwap', () => {
     ['loose minimum-out', { otherAmountThreshold: '48499' }, /looser/],
     ['zero output', { outAmount: '0', otherAmountThreshold: '0' }, /no output/],
     ['no requestId', { requestId: '' }, /requestId/],
+    ['gasless flag', { gasless: true }, /gasless/],
+    [
+      'sponsored signature fee',
+      { signatureFeePayer: Keypair.generate().publicKey.toBase58() },
+      /not the taker/,
+    ],
   ]
   for (const [name, patch, re] of refusals) {
     it(`refuses to sign an order with ${name}`, async () => {
       const h = jupiterHarness({ order: patch })
-      await expect(h.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(re)
+      await expect(h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)).rejects.toThrow(re)
       expect(h.calls).toHaveLength(1) // /execute never reached
+      expect(h.signedCalls).toHaveLength(0)
     })
   }
 
@@ -897,12 +1343,35 @@ describe('JupiterSwap', () => {
     expect(h.calls).toHaveLength(1)
   })
 
-  it('surfaces HTTP errors with the status', async () => {
-    const h = jupiterHarness({ orderStatus: 500, order: { error: 'upstream down' } })
-    await expect(h.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(/HTTP 500.*upstream down/)
+  it('refuses a gasless transaction whose fee payer is not the taker (even without a gasless flag)', async () => {
+    const sponsor = Keypair.generate().publicKey
+    const h = jupiterHarness({
+      order: (owner) => ({
+        transaction: unsignedV0(sponsor, owner.publicKey), // taker signs, sponsor pays → sponsor's sig is the id
+        requestId: 'r',
+        inputMint: JUP_IN,
+        outputMint: JUP_OUT,
+        inAmount: '1000000',
+        outAmount: '50000',
+        otherAmountThreshold: '49000',
+      }),
+    })
+    await expect(h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)).rejects.toThrow(
+      /fee payer .* is not the taker/,
+    )
+    expect(h.calls).toHaveLength(1)
+    expect(h.signedCalls).toHaveLength(0)
   })
 
-  it('throws on execute Failed, carrying the signature', async () => {
+  it('surfaces order HTTP errors with the status (nothing signed)', async () => {
+    const h = jupiterHarness({ orderStatus: 500, order: { error: 'upstream down' } })
+    await expect(h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)).rejects.toThrow(
+      /HTTP 500.*upstream down/,
+    )
+    expect(h.signedCalls).toHaveLength(0)
+  })
+
+  it('throws on execute Failed, carrying our signature', async () => {
     const h = jupiterHarness({
       execute: (tx) => ({
         status: 'Failed',
@@ -911,73 +1380,68 @@ describe('JupiterSwap', () => {
         signature: bs58.encode(tx.signatures[0]!),
       }),
     })
-    const p = h.swap.swapBaseToQuote(1_000_000n, 300)
+    const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
     await expect(p).rejects.toBeInstanceOf(JupiterSwapError)
     await expect(p).rejects.toThrow(/Failed.*-1005.*slippage/)
-    await expect(p).rejects.toMatchObject({ signature: expect.any(String) })
+    await expect(p).rejects.toMatchObject({ signature: h.signedCalls[0]!.signature })
+  })
+
+  it('an /execute HTTP error or timeout still carries our signature (it may have been submitted)', async () => {
+    const h = jupiterHarness({ executeStatus: 502, execute: () => ({ error: 'bad gateway' }) })
+    const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    await expect(p).rejects.toBeInstanceOf(JupiterSwapError)
+    await expect(p).rejects.toThrow(/HTTP 502/)
+    await expect(p).rejects.toMatchObject({ signature: h.signedCalls[0]!.signature })
   })
 
   it('rejects a Success for a different signature than the one we signed', async () => {
     const h = jupiterHarness({
-      execute: () => ({
-        status: 'Success',
-        signature: bs58.encode(Buffer.alloc(64, 1)),
-        totalInputAmount: '1',
-        totalOutputAmount: '1',
-      }),
+      execute: () => ({ status: 'Success', signature: bs58.encode(Buffer.alloc(64, 1)) }),
     })
-    await expect(h.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(/≠ the transaction we signed/)
+    const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    await expect(p).rejects.toThrow(/≠ the transaction we signed/)
+    await expect(p).rejects.toMatchObject({ signature: h.signedCalls[0]!.signature })
   })
 
-  it('requires execute totals', async () => {
-    const h = jupiterHarness({
-      execute: (tx) => ({ status: 'Success', signature: bs58.encode(tx.signatures[0]!) }),
-    })
-    await expect(h.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(/totalInputAmount/)
+  it('accepts a Success without a signature field (ours is the tx id)', async () => {
+    const h = jupiterHarness({ execute: () => ({ status: 'Success' }) })
+    const r = await h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+    expect(r.signature).toBe(h.signedCalls[0]!.signature)
   })
 
-  it('checks the signature on our own RPC after Success', async () => {
+  it('checks the signature on our own RPC after Success (errors carry the signature)', async () => {
     const failed = jupiterHarness({
       rpcStatus: { err: { InstructionError: [2, 'Custom'] }, confirmationStatus: 'confirmed' },
     })
-    await expect(failed.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(/failed on-chain/)
+    const p1 = failed.swap.swapBaseToQuote(1_000_000n, 300, failed.onSigned)
+    await expect(p1).rejects.toThrow(/failed on-chain/)
+    await expect(p1).rejects.toMatchObject({ signature: failed.signedCalls[0]!.signature })
     const unseen = jupiterHarness({ rpcStatus: null })
-    await expect(unseen.swap.swapBaseToQuote(1_000_000n, 300)).rejects.toThrow(/hasn't confirmed/)
+    const p2 = unseen.swap.swapBaseToQuote(1_000_000n, 300, unseen.onSigned)
+    await expect(p2).rejects.toThrow(/hasn't confirmed/)
+    await expect(p2).rejects.toMatchObject({ signature: unseen.signedCalls[0]!.signature })
+    expect(unseen.txLookups).toHaveLength(0)
+  })
+
+  it('refuses to book a tx whose meta differs from the order (with the signature)', async () => {
+    for (const [inRaw, outRaw, re] of [
+      [999_999n, 49_876n, /signed for exactly/],
+      [1_000_000n, 48_499n, /signed minimum/], // below otherAmountThreshold 48_500
+    ] as const) {
+      const h = jupiterHarness({ tx: (me) => swapTxResponse(me, JUP_IN, JUP_OUT, inRaw, outRaw) })
+      const p = h.swap.swapBaseToQuote(1_000_000n, 300, h.onSigned)
+      await expect(p).rejects.toBeInstanceOf(JupiterSwapError)
+      await expect(p).rejects.toThrow(re)
+      await expect(p).rejects.toMatchObject({ signature: h.signedCalls[0]!.signature })
+    }
+    const missing = jupiterHarness({ tx: () => null })
+    const p = missing.swap.swapBaseToQuote(1_000_000n, 300, missing.onSigned)
+    await expect(p).rejects.toThrow(/not returned by getTransaction/)
+    await expect(p).rejects.toMatchObject({ signature: missing.signedCalls[0]!.signature })
   })
 })
 
-// ── sendAndConfirmSigned ─────────────────────────────────────────────────────
-
-function fakeSendConnection(p: {
-  statuses: Array<{ slot: number; err: unknown; confirmationStatus: string } | null>
-  history?: { slot: number; err: unknown; confirmationStatus: string } | null
-  finalizedHeight?: number
-  sendThrows?: Error
-}) {
-  const sends: Array<{ skipPreflight?: boolean }> = []
-  let i = 0
-  const conn: VenueSendConnection = {
-    getLatestBlockhash: async () => ({
-      blockhash: bs58.encode(Buffer.alloc(32, 9)),
-      lastValidBlockHeight: 100,
-    }),
-    sendRawTransaction: async (_raw: unknown, o?: { skipPreflight?: boolean }) => {
-      sends.push({ skipPreflight: o?.skipPreflight })
-      if (p.sendThrows && sends.length === 1) throw p.sendThrows
-      return 'ignored'
-    },
-    getSignatureStatuses: async (_sigs: string[], cfg?: { searchTransactionHistory?: boolean }) => ({
-      context: { slot: 1 },
-      value: [
-        cfg?.searchTransactionHistory
-          ? (p.history ?? null)
-          : (p.statuses[Math.min(i++, p.statuses.length - 1)] ?? null),
-      ],
-    }),
-    getBlockHeight: async () => p.finalizedHeight ?? 50,
-  } as unknown as VenueSendConnection
-  return { conn, sends }
-}
+// ── sign / send / confirm ────────────────────────────────────────────────────
 
 function legacyTx(payer: Keypair): Transaction {
   return new Transaction().add(
@@ -989,12 +1453,63 @@ function legacyTx(payer: Keypair): Transaction {
   )
 }
 
+describe('signWithFreshBlockhash + sendSignedAndConfirm', () => {
+  const fast = { sleep: noSleep, pollMs: 0, resendMs: 0 }
+
+  it('signs without sending, then broadcasts exactly those bytes (never re-signed)', async () => {
+    const payer = Keypair.generate()
+    const { conn, sends } = fakeRpc({
+      statuses: [null, null, { slot: 7, err: null, confirmationStatus: 'confirmed' }],
+    })
+    const tx = legacyTx(payer)
+    const signed = await signWithFreshBlockhash(conn, tx, [payer])
+    expect(sends).toHaveLength(0)
+    expect(signed.signature).toBe(bs58.encode(tx.signature!))
+    expect(signed.blockhash).toBe(bs58.encode(Buffer.alloc(32, 9)))
+    expect(signed.lastValidBlockHeight).toBe(100)
+    expect(firstSig(signed.bytes)).toBe(signed.signature)
+
+    const res = await sendSignedAndConfirm(conn, signed, fast)
+    expect(res).toEqual({ signature: signed.signature, slot: 7 })
+    expect(sends.length).toBeGreaterThanOrEqual(2)
+    for (const s of sends) expect(Buffer.from(s.raw).equals(Buffer.from(signed.bytes))).toBe(true)
+  })
+
+  it('does not declare expiry from a history view older than the finalized-height view', async () => {
+    const payer = Keypair.generate()
+    let t = 0
+    const { conn } = fakeRpc({
+      statuses: [null],
+      finalizedHeight: 101,
+      finalizedSlot: 500,
+      history: null,
+      historyContextSlot: 499, // lagging node: its "not found" proves nothing
+    })
+    const signed = await signWithFreshBlockhash(conn, legacyTx(payer), [payer])
+    await expect(
+      sendSignedAndConfirm(conn, signed, { ...fast, timeoutMs: 5, now: () => (t += 2) }),
+    ).rejects.toMatchObject({ failure: 'timeout', signature: signed.signature })
+    // …but the same "not found" from a view at/after that slot is a proof
+    const fresh = fakeRpc({
+      statuses: [null],
+      finalizedHeight: 101,
+      finalizedSlot: 500,
+      history: null,
+      historyContextSlot: 500,
+    })
+    await expect(sendSignedAndConfirm(fresh.conn, signed, fast)).rejects.toMatchObject({
+      failure: 'expired',
+      signature: signed.signature,
+    })
+  })
+})
+
 describe('sendAndConfirmSigned', () => {
-  const fast = { sleep: async () => {}, pollMs: 0, resendMs: 0 }
+  const fast = { sleep: noSleep, pollMs: 0, resendMs: 0 }
 
   it('signs with a fresh blockhash, sends with preflight, rebroadcasts, and returns the fee payer signature', async () => {
     const payer = Keypair.generate()
-    const { conn, sends } = fakeSendConnection({
+    const { conn, sends } = fakeRpc({
       statuses: [
         null,
         { slot: 7, err: null, confirmationStatus: 'processed' },
@@ -1011,7 +1526,7 @@ describe('sendAndConfirmSigned', () => {
 
   it('throws on an on-chain error', async () => {
     const payer = Keypair.generate()
-    const { conn } = fakeSendConnection({
+    const { conn } = fakeRpc({
       statuses: [{ slot: 7, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'confirmed' }],
     })
     await expect(sendAndConfirmSigned(conn, legacyTx(payer), [payer], fast)).rejects.toMatchObject({
@@ -1021,12 +1536,12 @@ describe('sendAndConfirmSigned', () => {
 
   it('declares expiry only after finalized height passes lastValidBlockHeight and history is empty', async () => {
     const payer = Keypair.generate()
-    const { conn } = fakeSendConnection({ statuses: [null], finalizedHeight: 101, history: null })
+    const { conn } = fakeRpc({ statuses: [null], finalizedHeight: 101, history: null })
     const p = sendAndConfirmSigned(conn, legacyTx(payer), [payer], fast)
     await expect(p).rejects.toBeInstanceOf(VenueTxError)
     await expect(p).rejects.toMatchObject({ failure: 'expired' })
     // …but a late landing found in history is a success
-    const late = fakeSendConnection({
+    const late = fakeRpc({
       statuses: [null],
       finalizedHeight: 101,
       history: { slot: 99, err: null, confirmationStatus: 'finalized' },
@@ -1036,7 +1551,7 @@ describe('sendAndConfirmSigned', () => {
 
   it('maps an RPC rejection (preflight) to a preflight failure', async () => {
     const payer = Keypair.generate()
-    const { conn } = fakeSendConnection({
+    const { conn } = fakeRpc({
       statuses: [null],
       sendThrows: new SendTransactionError({
         action: 'send',
@@ -1052,7 +1567,7 @@ describe('sendAndConfirmSigned', () => {
 
   it('keeps polling through a transport error on the first send', async () => {
     const payer = Keypair.generate()
-    const { conn } = fakeSendConnection({
+    const { conn } = fakeRpc({
       statuses: [{ slot: 3, err: null, confirmationStatus: 'confirmed' }],
       sendThrows: new Error('socket hang up'),
     })
@@ -1062,7 +1577,7 @@ describe('sendAndConfirmSigned', () => {
   it('gives up with a timeout when the outcome stays unknown', async () => {
     const payer = Keypair.generate()
     let t = 0
-    const { conn } = fakeSendConnection({ statuses: [null] })
+    const { conn } = fakeRpc({ statuses: [null] })
     await expect(
       sendAndConfirmSigned(conn, legacyTx(payer), [payer], { ...fast, timeoutMs: 5, now: () => (t += 2) }),
     ).rejects.toMatchObject({ failure: 'timeout' })

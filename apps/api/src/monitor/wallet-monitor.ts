@@ -41,8 +41,11 @@ export interface WalletMonitorOptions {
   hysteresisPpm: bigint
   /** last known PUMP/USD × 1e18, or null when no price has ever been known */
   getPumpUsdE18: () => bigint | null
-  /** jackpot pot J and payouts owed but not yet landed (raw PUMP) */
-  getReservedRaw: () => Promise<{ jackpotRaw: bigint; outstandingRaw: bigint }>
+  /**
+   * jackpot pot J and payouts owed but NOT landed by `slot` (the slot of the finalized PRIZE balance read), so
+   * a payout that confirmed after that slot is still counted — balance and liabilities are slot-consistent
+   */
+  getReservedRaw: (slot: number) => Promise<{ jackpotRaw: bigint; outstandingRaw: bigint }>
   alerter: Alerter
   intervalMs?: number
   /** decimals of the payout mint (PUMP = 6) */
@@ -178,24 +181,21 @@ export class WalletMonitor {
     const { chain, prizeAddress, creatorAddress, pumpMint } = this.o
     const trigger = this.pendingReason
     this.pendingReason = null
-    let reads: [
-      { value: bigint },
-      { value: bigint },
-      { value: bigint } | null,
-      { jackpotRaw: bigint; outstandingRaw: bigint },
-    ]
+    let reads: [{ value: bigint }, { value: bigint; slot: number }, { value: bigint } | null]
+    let reserved: { jackpotRaw: bigint; outstandingRaw: bigint }
     try {
       reads = await Promise.all([
         chain.getSolBalance(prizeAddress, 'confirmed'),
-        chain.getTokenBalance(prizeAddress, pumpMint, 'finalized'),
+        // only the ATA is spendable by payouts; PUMP sitting in other PRIZE accounts is not pool
+        chain.getAtaBalance(prizeAddress, pumpMint, 'finalized'),
         creatorAddress ? chain.getSolBalance(creatorAddress, 'confirmed') : Promise.resolve(null),
-        this.o.getReservedRaw(),
       ])
+      reserved = await this.o.getReservedRaw(reads[1].slot)
     } catch (err) {
       this.fail(err, trigger)
       return
     }
-    const [prizeSol, prizePump, creatorSol, reserved] = reads
+    const [prizeSol, prizePump, creatorSol] = reads
     const { economy, hysteresisPpm } = this.o
 
     // pool vs reserve (fail closed when no price has ever been known)

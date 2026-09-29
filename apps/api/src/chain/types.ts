@@ -70,9 +70,12 @@ export interface TransferTxRequest {
   recipient: string
   mint: string
   amountRaw: bigint
-  /** memo written first in the tx (payouts: `scratchy:<deployId>:<payoutId>`) — also makes each tx unique */
+  /** memo placed immediately before the transfer (Token-2022 required-memo position); payouts use
+   *  `scratchy:<deployId>:<payoutId>` — it also makes every tx unique and is the on-chain receipt */
   memo: string
   priorityFeeMicroLamports: number
+  /** compute-unit limit (default ~120k); the worker raises it from the simulation when a hook needs more */
+  computeUnitLimit?: number
 }
 
 export interface BuiltTransferTx extends SignedTx {
@@ -82,6 +85,15 @@ export interface BuiltTransferTx extends SignedTx {
 
 export function payoutMemo(deployId: string, payoutId: bigint | string): string {
   return `scratchy:${deployId}:${payoutId.toString()}`
+}
+
+/** Token balance changes of one owner caused by one confirmed transaction (from the tx's own meta). */
+export interface OwnerTokenDeltas {
+  signature: string
+  slot: number
+  err: string | null
+  /** mint → net change (raw) across all of the owner's token accounts in this tx */
+  deltas: Map<string, bigint>
 }
 
 /** A parsed on-chain payout, for the rehearsal's verify-every-payout pass. */
@@ -113,7 +125,12 @@ export interface ChainClient {
   getMintInfo(mint: string): Promise<MintInfo>
   /** total balance of `owner` for `mint` across all its token accounts */
   getTokenBalance(owner: string, mint: string, commitment?: Commitment): Promise<BalanceAt>
-  /** batched holdings for many owners (ATA batch read + per-owner fallback) */
+  /** balance of the owner's associated token account only (what a transfer can actually spend) */
+  getAtaBalance(owner: string, mint: string, commitment?: Commitment): Promise<BalanceAt>
+  /**
+   * Holdings for many owners, ALL read at one common slot (every token account of each owner summed), so the
+   * same tokens can never be counted for two entrants by moving them between reads.
+   */
   getHoldings(owners: string[], mint: string): Promise<BalanceAt<Map<string, bigint>>>
   /** does the owner's associated token account for `mint` exist */
   ataExists(owner: string, mint: string): Promise<boolean>
@@ -127,6 +144,8 @@ export interface ChainClient {
   estimatePriorityFee(): Promise<number>
 
   getPayoutTx(signature: string, mint: string, senderOwner: string): Promise<ParsedPayoutTx | null>
+  /** exact token deltas of `owner` from a confirmed tx's pre/post balances; null if the tx isn't known */
+  getOwnerTokenDeltas(signature: string, owner: string): Promise<OwnerTokenDeltas | null>
 
   /** addresses of the server-held signers (CREATOR may be null when the sweeper is disabled) */
   readonly prizeAddress: string

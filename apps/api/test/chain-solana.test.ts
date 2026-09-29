@@ -33,6 +33,7 @@ import { clusterFromGenesis, GENESIS_HASHES, verifyCluster } from '../src/chain/
 import { keypairFromEnv, loadKeypair, loadKeypairFile } from '../src/chain/keys'
 import { decodeMintAccount, inspectMint } from '../src/chain/mint'
 import {
+  decodeTokenAccount,
   decodeTokenAccountAmount,
   MEMO_PROGRAM_ID,
   parsePayoutTx,
@@ -106,6 +107,7 @@ function tokenAccountData(
   owner: PublicKey,
   amount: bigint,
   token2022Extensions = false,
+  state: AccountState = AccountState.Initialized,
 ): Buffer {
   const base = Buffer.alloc(ACCOUNT_SIZE)
   AccountLayout.encode(
@@ -115,7 +117,7 @@ function tokenAccountData(
       amount,
       delegateOption: 0,
       delegate: PublicKey.default,
-      state: AccountState.Initialized,
+      state,
       isNativeOption: 0,
       isNative: 0n,
       delegatedAmount: 0n,
@@ -140,8 +142,6 @@ class StubConnection {
   rpcEndpoint = 'https://api.devnet.solana.com'
   calls: Call[] = []
   accounts = new Map<string, AccountInfo<Buffer>>()
-  /** owner → token accounts returned by getTokenAccountsByOwner */
-  ownerAccounts = new Map<string, AccountInfo<Buffer>[]>()
   slot = 5_000
   genesis: string = GENESIS_HASHES.devnet
   statusContextSlots: number[] = []
@@ -149,6 +149,16 @@ class StubConnection {
   simulateValue: object = { err: null, logs: ['Program log: ok'], unitsConsumed: 42_000 }
   prioritizationFees: number[] = []
   sendError: Error | null = null
+  /** getAccountInfo for these addresses fails like a flaky RPC */
+  failAccountInfo = new Set<string>()
+  /** context slots handed, in call order, to getMultipleAccountsInfoAndContext (then `slot`) */
+  multiSlots: number[] = []
+  /** errors thrown, in call order, by getMultipleAccountsInfoAndContext (null = answer normally) */
+  multiErrors: (Error | null)[] = []
+  /** runs after every getTokenAccountsByOwner answer (lets a test move tokens between discovery and read) */
+  afterTokenAccountsByOwner: (() => void) | null = null
+  /** signature → getTransaction response */
+  txs = new Map<string, object>()
 
   private log(method: string, ...args: unknown[]) {
     this.calls.push({ method, args })
@@ -163,27 +173,47 @@ class StubConnection {
   }
   async getAccountInfo(pk: PublicKey, commitment?: unknown) {
     this.log('getAccountInfo', pk.toBase58(), commitment)
+    if (this.failAccountInfo.has(pk.toBase58())) throw new Error('503 Service Unavailable')
     return this.accounts.get(pk.toBase58()) ?? null
+  }
+  async getAccountInfoAndContext(pk: PublicKey, commitment?: unknown) {
+    this.log('getAccountInfoAndContext', pk.toBase58(), commitment)
+    return { context: { slot: this.slot }, value: this.accounts.get(pk.toBase58()) ?? null }
   }
   async getLatestBlockhash(commitment?: unknown) {
     this.log('getLatestBlockhash', commitment)
     return { blockhash: BLOCKHASH, lastValidBlockHeight: 9_150 }
   }
-  async getMultipleAccountsInfoAndContext(pks: PublicKey[], commitment?: unknown) {
+  async getMultipleAccountsInfoAndContext(pks: PublicKey[], config?: unknown) {
     this.log(
       'getMultipleAccountsInfoAndContext',
       pks.map((p) => p.toBase58()),
-      commitment,
+      config,
     )
-    return { context: { slot: this.slot }, value: pks.map((p) => this.accounts.get(p.toBase58()) ?? null) }
+    const err = this.multiErrors.shift()
+    if (err) throw err
+    return {
+      context: { slot: this.multiSlots.shift() ?? this.slot },
+      value: pks.map((p) => this.accounts.get(p.toBase58()) ?? null),
+    }
   }
+  /** like the RPC's token index: every token-program account whose mint and owner fields match */
   async getTokenAccountsByOwner(owner: PublicKey, filter: { mint: PublicKey }, commitment?: unknown) {
     this.log('getTokenAccountsByOwner', owner.toBase58(), filter.mint.toBase58(), commitment)
-    const accs = this.ownerAccounts.get(owner.toBase58()) ?? []
-    return {
-      context: { slot: this.slot - 3 },
-      value: accs.map((a, i) => ({ pubkey: seeded(100 + i).publicKey, account: a })),
+    const value: { pubkey: PublicKey; account: AccountInfo<Buffer> }[] = []
+    for (const [address, acc] of this.accounts) {
+      const tokenProgram = acc.owner.equals(TOKEN_PROGRAM_ID) || acc.owner.equals(TOKEN_2022_PROGRAM_ID)
+      if (!tokenProgram || acc.data.length < ACCOUNT_SIZE) continue
+      if (!acc.data.subarray(0, 32).equals(filter.mint.toBuffer())) continue
+      if (!acc.data.subarray(32, 64).equals(owner.toBuffer())) continue
+      value.push({ pubkey: new PublicKey(address), account: acc })
     }
+    this.afterTokenAccountsByOwner?.()
+    return { context: { slot: this.slot - 3 }, value }
+  }
+  async getTransaction(signature: string, config?: unknown) {
+    this.log('getTransaction', signature, config)
+    return this.txs.get(signature) ?? null
   }
   async getSignatureStatuses(sigs: string[], config?: unknown) {
     this.log('getSignatureStatuses', sigs, config)
@@ -222,18 +252,69 @@ function setup(
   const conn = new StubConnection()
   conn.accounts.set(MINT.toBase58(), account(TOKEN_2022_PROGRAM_ID, pumpLikeMint()))
   conn.accounts.set(LEGACY_MINT.toBase58(), account(TOKEN_PROGRAM_ID, mintData(9, 5_000n)))
+  const clock = { now: 1_700_000_000_000 }
   const client = new SolanaChainClient({
     connection: conn as unknown as Connection,
     cluster: 'devnet',
     prize: PRIZE,
     creator: opts.creator === false ? null : CREATOR,
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    now: () => clock.now,
+    holdingsRetryDelayMs: 0,
   })
-  return { conn, client }
+  return { conn, client, clock }
 }
 
 const ata = (owner: PublicKey, mint = MINT, program = TOKEN_2022_PROGRAM_ID) =>
   getAssociatedTokenAddressSync(mint, owner, true, program)
+
+/** put a token account of `mint` (owner field `owner`) at `address` */
+function putToken(
+  conn: StubConnection,
+  address: PublicKey,
+  owner: PublicKey,
+  amount: bigint,
+  opts: { mint?: PublicKey; ext?: boolean; state?: AccountState } = {},
+) {
+  const mint = opts.mint ?? MINT
+  const program = mint.equals(LEGACY_MINT) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID
+  conn.accounts.set(
+    address.toBase58(),
+    account(program, tokenAccountData(mint, owner, amount, opts.ext ?? false, opts.state)),
+  )
+}
+
+// transfer-hook extra-account-metas account (spl-transfer-hook-interface ExtraAccountMetaList for Execute)
+const HOOK = seeded(30).publicKey
+const EXECUTE_DISCRIMINATOR = Buffer.from([105, 37, 101, 197, 75, 251, 102, 26])
+type HookMeta = { discriminator: number; config: number[]; isSigner?: boolean; isWritable?: boolean }
+
+function extraMetasData(metas: HookMeta[]): Buffer {
+  const list = Buffer.alloc(4 + 35 * metas.length)
+  list.writeUInt32LE(metas.length, 0)
+  metas.forEach((m, i) => {
+    const o = 4 + 35 * i
+    list[o] = m.discriminator
+    Buffer.from(m.config).copy(list, o + 1)
+    list[o + 33] = m.isSigner ? 1 : 0
+    list[o + 34] = m.isWritable ? 1 : 0
+  })
+  const len = Buffer.alloc(4)
+  len.writeUInt32LE(list.length, 0)
+  return Buffer.concat([EXECUTE_DISCRIMINATOR, len, list])
+}
+
+/** a mint with hook program HOOK and (unless `validation` is null) its validation account */
+function withHook(
+  conn: StubConnection,
+  metas: HookMeta[],
+  validation: { owner: PublicKey } | null = { owner: HOOK },
+) {
+  conn.accounts.set(MINT.toBase58(), account(TOKEN_2022_PROGRAM_ID, pumpLikeMint(HOOK)))
+  const address = getExtraAccountMetaAddress(MINT, HOOK)
+  if (validation) conn.accounts.set(address.toBase58(), account(validation.owner, extraMetasData(metas)))
+  return address
+}
 
 function decodeTx(bytes: Uint8Array) {
   const tx = VersionedTransaction.deserialize(bytes)
@@ -475,7 +556,7 @@ describe('mint inspection', () => {
 // ── buildTransferTx ──────────────────────────────────────────────────────────
 
 describe('buildTransferTx', () => {
-  it('orders instructions: compute budget → idempotent ATA create → memo → hook-aware transferChecked', async () => {
+  it('orders instructions: compute budget → idempotent ATA create → memo → transferChecked', async () => {
     const { conn, client } = setup()
     const built = await client.buildTransferTx(baseReq)
     const { tx, keys, ixs } = decodeTx(built.bytes)
@@ -520,16 +601,138 @@ describe('buildTransferTx', () => {
     expect(transfer.data[0]).toBe(12)
     expect(transfer.data.readBigUInt64LE(1)).toBe(12_500_000_000n)
     expect(transfer.data[9]).toBe(6)
-    expect(transfer.accounts.slice(0, 4)).toEqual([
+    // hook extension present but its program unset → a plain transferChecked, exactly 4 accounts
+    expect(transfer.accounts).toEqual([
       ata(PRIZE.publicKey).toBase58(),
       MINT.toBase58(),
       ata(ALICE).toBase58(),
       PRIZE.publicKey.toBase58(),
     ])
-    // the hook-aware builder looked for the hook's extra-account-meta list (none: program unset)
+    // …and the extra-account-metas PDA of the default program id is never even looked at
     const validation = getExtraAccountMetaAddress(MINT, PublicKey.default).toBase58()
-    expect(conn.callsTo('getAccountInfo').some((c) => c.args[0] === validation)).toBe(true)
+    expect(conn.callsTo('getAccountInfo').some((c) => c.args[0] === validation)).toBe(false)
     expect(built.createsAta).toBe(true)
+  })
+
+  it('an unset hook cannot be griefed by funding the default-program validation PDA', async () => {
+    const { conn, client } = setup()
+    const griefPda = getExtraAccountMetaAddress(MINT, PublicKey.default)
+    // anyone can create an account at this address (e.g. owned by the System Program, garbage data)
+    conn.accounts.set(griefPda.toBase58(), account(SystemProgram.programId, Buffer.alloc(3, 0xff)))
+    const built = await client.buildTransferTx(baseReq)
+    const transfer = decodeTx(built.bytes).ixs[4]!
+    expect(transfer.accounts.length).toBe(4)
+    expect(transfer.accounts).not.toContain(griefPda.toBase58())
+    // reads: our cached mint inspect, the destination ATA check, one fresh mint read — nothing else
+    expect(conn.callsTo('getAccountInfo').map((c) => c.args[0])).toEqual([
+      MINT.toBase58(),
+      ata(ALICE).toBase58(),
+      MINT.toBase58(),
+    ])
+  })
+
+  it('appends the extra accounts resolved from a hook program’s own validation account', async () => {
+    const { conn, client } = setup()
+    const fixed = seeded(40).publicKey
+    const validation = withHook(conn, [
+      // a fixed writable account
+      { discriminator: 0, config: [...fixed.toBytes()], isWritable: true },
+      // a hook-program PDA from a literal and the destination key (account index 2)
+      { discriminator: 1, config: [1, 7, ...Buffer.from('counter'), 3, 2], isWritable: true },
+      // a hook-program PDA from account data: the source account's owner field (bytes 32..64)
+      { discriminator: 1, config: [4, 0, 32, 32] },
+    ])
+    putToken(conn, ata(PRIZE.publicKey), PRIZE.publicKey, 1_000_000n, { ext: true })
+
+    const built = await client.buildTransferTx(baseReq)
+    const { tx, keys, ixs } = decodeTx(built.bytes)
+    const transfer = ixs[4]!
+    expect(transfer.program).toBe(TOKEN_2022_PROGRAM_ID.toBase58())
+    const counter = PublicKey.findProgramAddressSync([Buffer.from('counter'), ata(ALICE).toBuffer()], HOOK)[0]
+    const bySource = PublicKey.findProgramAddressSync([PRIZE.publicKey.toBuffer()], HOOK)[0]
+    expect(transfer.accounts).toEqual([
+      ata(PRIZE.publicKey).toBase58(),
+      MINT.toBase58(),
+      ata(ALICE).toBase58(),
+      PRIZE.publicKey.toBase58(),
+      fixed.toBase58(),
+      counter.toBase58(),
+      bySource.toBase58(),
+      HOOK.toBase58(),
+      validation.toBase58(),
+    ])
+    const writable = (pk: PublicKey) => tx.message.isAccountWritable(keys.findIndex((k) => k.equals(pk)))
+    expect(writable(fixed)).toBe(true)
+    expect(writable(bySource)).toBe(false)
+    expect(writable(validation)).toBe(false)
+    // the validation account is read once — the extras come from exactly the account whose owner was checked
+    expect(conn.callsTo('getAccountInfo').filter((c) => c.args[0] === validation.toBase58()).length).toBe(1)
+    // the order around the transfer is unchanged: memo immediately before it
+    expect(ixs[3]!.program).toBe(MEMO_PROGRAM_ID.toBase58())
+  })
+
+  it('refuses (non-transient) a hook whose validation account is missing or not owned by the hook', async () => {
+    for (const validation of [null, { owner: SystemProgram.programId }, { owner: seeded(41).publicKey }]) {
+      const { conn, client } = setup()
+      withHook(conn, [{ discriminator: 0, config: [...seeded(40).publicKey.toBytes()] }], validation)
+      const err = await client.buildTransferTx(baseReq).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(Error)
+      expect(err).not.toBeInstanceOf(TransientChainError)
+      expect((err as Error).message).toMatch(/transfer hook .* cannot be resolved/)
+      expect((err as Error).message).toMatch(validation ? /not the hook program/ : /does not exist/)
+    }
+  })
+
+  it('refuses a hook whose extras demand a signature or cannot be decoded', async () => {
+    const { conn, client } = setup()
+    withHook(conn, [{ discriminator: 0, config: [...seeded(40).publicKey.toBytes()], isSigner: true }])
+    const signer = await client.buildTransferTx(baseReq).catch((e: unknown) => e)
+    expect(signer).not.toBeInstanceOf(TransientChainError)
+    expect((signer as Error).message).toMatch(/cannot be resolved: an extra account demands a signature/)
+
+    const validation = getExtraAccountMetaAddress(MINT, HOOK)
+    conn.accounts.set(validation.toBase58(), account(HOOK, Buffer.from([1, 2, 3])))
+    const garbage = await client.buildTransferTx(baseReq).catch((e: unknown) => e)
+    expect(garbage).toBeInstanceOf(Error)
+    expect(garbage).not.toBeInstanceOf(TransientChainError)
+    expect((garbage as Error).message).toMatch(/cannot be resolved/)
+  })
+
+  it('RPC failures while resolving a set hook stay transient', async () => {
+    const { conn, client } = setup()
+    const validation = withHook(conn, [{ discriminator: 1, config: [4, 0, 32, 32] }])
+    conn.failAccountInfo.add(ata(PRIZE.publicKey).toBase58()) // the account-data seed read
+    await expect(client.buildTransferTx(baseReq)).rejects.toBeInstanceOf(TransientChainError)
+    conn.failAccountInfo.clear()
+    conn.failAccountInfo.add(validation.toBase58())
+    await expect(client.buildTransferTx(baseReq)).rejects.toBeInstanceOf(TransientChainError)
+  })
+
+  it('re-reads the mint for every build, so a hook program set at runtime is seen', async () => {
+    const { conn, client } = setup()
+    await client.getMintInfo(MINT.toBase58()) // metadata cached with the hook unset
+    expect(decodeTx((await client.buildTransferTx(baseReq)).bytes).ixs[4]!.accounts.length).toBe(4)
+    withHook(conn, [], null) // hook program set, no validation account yet
+    await expect(client.buildTransferTx(baseReq)).rejects.toThrow(/cannot be resolved/)
+  })
+
+  it('honours the request compute-unit limit, clamped to [20k, 1.4M]', async () => {
+    const { client } = setup()
+    const limitOf = async (computeUnitLimit?: number) =>
+      decodeTx(
+        (await client.buildTransferTx({ ...baseReq, computeUnitLimit })).bytes,
+      ).ixs[0]!.data.readUInt32LE(1)
+    expect(await limitOf(undefined)).toBe(120_000)
+    expect(await limitOf(250_000)).toBe(250_000)
+    expect(await limitOf(180_000.9)).toBe(180_000)
+    expect(await limitOf(5_000)).toBe(20_000)
+    expect(await limitOf(9_000_000)).toBe(1_400_000)
+    await expect(client.buildTransferTx({ ...baseReq, computeUnitLimit: Number.NaN })).rejects.toThrow(
+      /compute unit limit/,
+    )
+    const a = await client.buildTransferTx({ ...baseReq, computeUnitLimit: 200_000 })
+    const b = await client.buildTransferTx({ ...baseReq, computeUnitLimit: 200_001 })
+    expect(a.signature).not.toBe(b.signature)
   })
 
   it('signature is the signed tx signature and verifies against the signer key', async () => {
@@ -653,8 +856,15 @@ describe('simulate and sendRaw', () => {
     conn.simulateValue = { err: 'AccountNotFound', logs: [], unitsConsumed: 0 }
     expect(classifyFailure((await client.simulate(built.bytes)).error)).toBe('low_gas')
 
-    conn.simulateValue = { err: { InstructionError: [4, { Custom: 17 }] }, logs: [] }
+    // AccountFrozen (0x11) is permanent when the logs attribute it to a token program…
+    conn.simulateValue = {
+      err: { InstructionError: [4, { Custom: 17 }] },
+      logs: ['Program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb failed: custom program error: 0x11'],
+    }
     expect(classifyFailure((await client.simulate(built.bytes)).error)).toBe('permanent')
+    // …but a bare code with no failing program is not attributed (retried; the rebuild's simulation has logs)
+    conn.simulateValue = { err: { InstructionError: [4, { Custom: 17 }] }, logs: [] }
+    expect(classifyFailure((await client.simulate(built.bytes)).error)).toBe('transient')
 
     conn.simulateValue = { err: 'BlockhashNotFound', logs: [] }
     expect(classifyFailure((await client.simulate(built.bytes)).error)).toBe('transient')
@@ -685,80 +895,210 @@ describe('simulate and sendRaw', () => {
 // ── holdings ─────────────────────────────────────────────────────────────────
 
 describe('getHoldings', () => {
-  it('decodes 165- and 175-byte token accounts and falls back to getTokenAccountsByOwner', async () => {
+  const multiCalls = (conn: StubConnection) =>
+    conn.callsTo('getMultipleAccountsInfoAndContext').map((c) => ({
+      keys: c.args[0] as string[],
+      config: c.args[1] as { commitment: string; minContextSlot?: number },
+    }))
+
+  /** n owners, each holding i + 1 in its ATA */
+  function manyOwners(conn: StubConnection, n: number, tag: number, mint = MINT) {
+    return Array.from({ length: n }, (_, i) => {
+      const seed = new Uint8Array(32)
+      seed[0] = i % 256
+      seed[1] = Math.floor(i / 256)
+      seed[2] = tag
+      const o = Keypair.fromSeed(seed).publicKey
+      const program = mint.equals(LEGACY_MINT) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID
+      putToken(conn, ata(o, mint, program), o, BigInt(i + 1), { mint })
+      return o
+    })
+  }
+
+  it('sums every token account of each owner, all read at one slot', async () => {
     const { conn, client } = setup()
     const carol = seeded(5).publicKey
     const dave = seeded(6).publicKey
     const erin = seeded(7).publicKey
-    // ALICE: Token-2022 ATA with extensions (175 bytes)
-    conn.accounts.set(
-      ata(ALICE).toBase58(),
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, ALICE, 500n, true)),
-    )
-    // BOB: extension-less account at the ATA (165 bytes)
-    conn.accounts.set(ata(BOB).toBase58(), account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, BOB, 7n)))
+    const frank = seeded(8).publicKey
+    // ALICE: Token-2022 ATA with extensions (175 bytes) + an auxiliary 165-byte account
+    putToken(conn, ata(ALICE), ALICE, 500n, { ext: true })
+    putToken(conn, seeded(60).publicKey, ALICE, 20n)
+    // BOB: extension-less account at the ATA (165 bytes) + a frozen one (still held)
+    putToken(conn, ata(BOB), BOB, 7n)
+    putToken(conn, seeded(61).publicKey, BOB, 3n, { state: AccountState.Frozen })
     // CAROL: no ATA, holds in two auxiliary accounts
-    conn.ownerAccounts.set(carol.toBase58(), [
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, carol, 100n, true)),
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, carol, 23n)),
-    ])
+    putToken(conn, seeded(62).publicKey, carol, 100n, { ext: true })
+    putToken(conn, seeded(63).publicKey, carol, 23n)
     // DAVE: empty ATA, nothing elsewhere
+    putToken(conn, ata(dave), dave, 0n, { ext: true })
+    // ERIN: the account at her ATA address has owner field ALICE (legacy-style reassignment) → Alice's
+    putToken(conn, ata(erin), ALICE, 999n)
+    // FRANK: token-shaped data at his ATA address, but not owned by a token program → nothing
     conn.accounts.set(
-      ata(dave).toBase58(),
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, dave, 0n, true)),
+      ata(frank).toBase58(),
+      account(SystemProgram.programId, tokenAccountData(MINT, frank, 777n)),
     )
-    // ERIN: account at the ATA address whose owner field is someone else → not hers
-    conn.accounts.set(
-      ata(erin).toBase58(),
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, ALICE, 999n)),
-    )
+    // a LEGACY_MINT account of Alice's does not count for MINT
+    putToken(conn, seeded(64).publicKey, ALICE, 5_000n, { mint: LEGACY_MINT })
 
-    const owners = [ALICE, BOB, carol, dave, erin].map((p) => p.toBase58())
+    const owners = [ALICE, BOB, carol, dave, erin, frank].map((p) => p.toBase58())
     const res = await client.getHoldings([...owners, ALICE.toBase58(), 'not-an-address'], MINT.toBase58())
 
-    expect(res.value.get(ALICE.toBase58())).toBe(500n)
-    expect(res.value.get(BOB.toBase58())).toBe(7n)
+    expect(res.value.get(ALICE.toBase58())).toBe(500n + 20n + 999n)
+    expect(res.value.get(BOB.toBase58())).toBe(10n)
     expect(res.value.get(carol.toBase58())).toBe(123n)
     expect(res.value.get(dave.toBase58())).toBe(0n)
     expect(res.value.get(erin.toBase58())).toBe(0n)
+    expect(res.value.get(frank.toBase58())).toBe(0n)
     expect(res.value.get('not-an-address')).toBe(0n)
-    expect(res.value.size).toBe(6)
-    expect(res.slot).toBe(conn.slot - 3) // oldest view among the reads
+    expect(res.value.size).toBe(7)
+    expect(res.slot).toBe(conn.slot)
 
-    const batch = conn.callsTo('getMultipleAccountsInfoAndContext')
-    expect(batch.length).toBe(1)
-    expect(batch[0]!.args[0]).toEqual(owners.map((o) => ata(new PublicKey(o)).toBase58()))
-    const fallback = conn.callsTo('getTokenAccountsByOwner').map((c) => c.args[0])
-    expect(fallback.sort()).toEqual([carol, dave, erin].map((p) => p.toBase58()).sort())
+    // discovery: one getTokenAccountsByOwner per valid owner
+    const discovery = conn.callsTo('getTokenAccountsByOwner')
+    expect(discovery.map((c) => c.args[0]).sort()).toEqual([...owners].sort())
+    expect(discovery.every((c) => c.args[1] === MINT.toBase58() && c.args[2] === 'confirmed')).toBe(true)
+    // one read of every discovered address (each once), no earlier than the discovery view
+    const reads = multiCalls(conn)
+    expect(reads.length).toBe(1)
+    expect(reads[0]!.config).toEqual({ commitment: 'confirmed', minContextSlot: conn.slot - 3 })
+    const expected = [
+      ata(ALICE),
+      seeded(60).publicKey,
+      ata(erin),
+      ata(BOB),
+      seeded(61).publicKey,
+      ata(carol),
+      seeded(62).publicKey,
+      seeded(63).publicKey,
+      ata(dave),
+      ata(frank),
+    ].map((p) => p.toBase58())
+    expect([...reads[0]!.keys].sort()).toEqual([...expected].sort())
+  })
+
+  it('takes amounts only from the one-slot read, never from discovery', async () => {
+    const { conn, client } = setup()
+    const carol = seeded(5).publicKey
+    putToken(conn, seeded(62).publicKey, carol, 100n)
+    // tokens leave the account between the discovery answer and the read
+    conn.afterTokenAccountsByOwner = () => putToken(conn, seeded(62).publicKey, carol, 1n)
+    const res = await client.getHoldings([carol.toBase58()], MINT.toBase58())
+    expect(res.value.get(carol.toBase58())).toBe(1n)
+  })
+
+  it('an account whose owner changed after discovery no longer counts for the old owner', async () => {
+    const { conn, client } = setup()
+    const carol = seeded(5).publicKey
+    const outsider = seeded(9).publicKey
+    const moved = seeded(62).publicKey
+    putToken(conn, ata(carol), carol, 5n)
+    putToken(conn, moved, carol, 100n)
+    putToken(conn, ata(BOB), BOB, 7n)
+    const owners = [carol, BOB].map((p) => p.toBase58())
+    expect((await client.getHoldings(owners, MINT.toBase58())).value.get(carol.toBase58())).toBe(105n)
+
+    // SetAuthority(owner) to someone who is not an entrant: the cached list still has it, the read says no
+    putToken(conn, moved, outsider, 100n)
+    const second = await client.getHoldings(owners, MINT.toBase58())
+    expect(second.value.get(carol.toBase58())).toBe(5n)
+    expect(second.value.get(BOB.toBase58())).toBe(7n)
+    expect(second.value.has(outsider.toBase58())).toBe(false)
+    // …or to another entrant: counted once, for its owner at the read slot
+    putToken(conn, moved, BOB, 100n)
+    const third = await client.getHoldings(owners, MINT.toBase58())
+    expect(third.value.get(carol.toBase58())).toBe(5n)
+    expect(third.value.get(BOB.toBase58())).toBe(107n)
+    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(2) // the lists were cached
+  })
+
+  it('refreshes an owner’s account list once it is an hour old', async () => {
+    const { conn, client, clock } = setup()
+    const carol = seeded(5).publicKey
+    putToken(conn, ata(carol), carol, 5n)
+    const get = async () =>
+      (await client.getHoldings([carol.toBase58()], MINT.toBase58())).value.get(carol.toBase58())
+    expect(await get()).toBe(5n)
+    putToken(conn, seeded(62).publicKey, carol, 40n) // a new account after discovery
+    clock.now += 59 * 60_000
+    expect(await get()).toBe(5n) // not discovered yet
+    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(1)
+    clock.now += 60_000
+    expect(await get()).toBe(45n)
+    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(2)
+  })
+
+  it('re-issues every chunk until they answer at one slot, raising minContextSlot', async () => {
+    const { conn, client } = setup()
+    const owners = manyOwners(conn, 150, 1)
+    conn.multiSlots = [5_000, 5_001, 5_001, 5_001]
+    const res = await client.getHoldings(
+      owners.map((o) => o.toBase58()),
+      MINT.toBase58(),
+    )
+    const reads = multiCalls(conn)
+    expect(reads.map((r) => r.keys.length)).toEqual([100, 50, 100, 50])
+    expect(reads.map((r) => r.config.minContextSlot)).toEqual([4_997, 4_997, 5_001, 5_001])
+    expect(res.slot).toBe(5_001)
+    owners.forEach((o, i) => expect(res.value.get(o.toBase58())).toBe(BigInt(i + 1)))
+  })
+
+  it('retries when a node has not reached minContextSlot; other RPC errors are transient at once', async () => {
+    const { conn, client } = setup()
+    const owners = manyOwners(conn, 150, 2).map((o) => o.toBase58())
+    conn.multiErrors = [
+      Object.assign(new Error('Minimum context slot has not been reached'), { code: -32016 }),
+    ]
+    const res = await client.getHoldings(owners, MINT.toBase58())
+    expect(multiCalls(conn).length).toBe(4)
+    expect(res.slot).toBe(conn.slot)
+    expect(res.value.get(owners[149]!)).toBe(150n)
+
+    conn.calls = []
+    conn.multiErrors = [new Error('429 Too Many Requests')]
+    await expect(client.getHoldings(owners, MINT.toBase58())).rejects.toBeInstanceOf(TransientChainError)
+    expect(multiCalls(conn).length).toBe(2) // one attempt, both chunks
+  })
+
+  it('gives up with TransientChainError when the chunks never agree on a slot', async () => {
+    const { conn, client } = setup()
+    const owners = manyOwners(conn, 150, 3).map((o) => o.toBase58())
+    conn.multiSlots = Array.from({ length: 20 }, (_, i) => 6_000 + i)
+    const err = await client.getHoldings(owners, MINT.toBase58()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(TransientChainError)
+    expect((err as Error).message).toMatch(/one slot after 5 attempts/)
+    expect(multiCalls(conn).length).toBe(10) // 1 + 4 retries, both chunks each time
   })
 
   it('reads legacy SPL token accounts via the legacy program ATA and chunks by 100', async () => {
     const { conn, client } = setup()
-    const owners = Array.from({ length: 250 }, (_, i) => {
-      const seed = new Uint8Array(32)
-      seed[0] = i
-      seed[1] = 77
-      return Keypair.fromSeed(seed).publicKey
-    })
-    owners.forEach((o, i) => {
-      conn.accounts.set(
-        ata(o, LEGACY_MINT, TOKEN_PROGRAM_ID).toBase58(),
-        account(TOKEN_PROGRAM_ID, tokenAccountData(LEGACY_MINT, o, BigInt(i + 1))),
-      )
-    })
+    const owners = manyOwners(conn, 250, 77, LEGACY_MINT)
     const res = await client.getHoldings(
       owners.map((o) => o.toBase58()),
       LEGACY_MINT.toBase58(),
     )
-    expect(
-      conn.callsTo('getMultipleAccountsInfoAndContext').map((c) => (c.args[0] as string[]).length),
-    ).toEqual([100, 100, 50])
-    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(0)
+    expect(multiCalls(conn).map((c) => c.keys.length)).toEqual([100, 100, 50])
+    expect(multiCalls(conn)[0]!.keys[0]).toBe(ata(owners[0]!, LEGACY_MINT, TOKEN_PROGRAM_ID).toBase58())
+    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(250)
     owners.forEach((o, i) => expect(res.value.get(o.toBase58())).toBe(BigInt(i + 1)))
     expect(res.slot).toBe(conn.slot)
+    // a second round reuses the discovered lists
+    await client.getHoldings(
+      owners.map((o) => o.toBase58()),
+      LEGACY_MINT.toBase58(),
+    )
+    expect(conn.callsTo('getTokenAccountsByOwner').length).toBe(250)
   })
 
-  it('decodeTokenAccountAmount checks mint and owner', () => {
+  it('with no valid owners it reads nothing and reports the current slot', async () => {
+    const { conn, client } = setup()
+    const res = await client.getHoldings(['nope', 'nope'], MINT.toBase58())
+    expect(res).toEqual({ value: new Map([['nope', 0n]]), slot: conn.slot })
+    expect(multiCalls(conn).length).toBe(0)
+  })
+
+  it('decodeTokenAccountAmount checks mint, owner and that the data is an initialized token account', () => {
     const data = tokenAccountData(MINT, ALICE, 1_234n, true)
     expect(data.length).toBe(175)
     expect(decodeTokenAccountAmount(data, MINT, ALICE)).toBe(1_234n)
@@ -766,14 +1106,27 @@ describe('getHoldings', () => {
     expect(decodeTokenAccountAmount(data, LEGACY_MINT, ALICE)).toBeNull()
     expect(decodeTokenAccountAmount(data, MINT, BOB)).toBeNull()
     expect(decodeTokenAccountAmount(data.subarray(0, 100), MINT)).toBeNull()
+    const frozen = tokenAccountData(MINT, ALICE, 9n, false, AccountState.Frozen)
+    expect(decodeTokenAccountAmount(frozen, MINT, ALICE)).toBe(9n)
+    expect(decodeTokenAccount(frozen)!.state).toBe(AccountState.Frozen)
+    const uninitialized = tokenAccountData(MINT, ALICE, 9n, false, AccountState.Uninitialized)
+    expect(decodeTokenAccountAmount(uninitialized, MINT, ALICE)).toBeNull()
+    // a multisig (355 bytes) or a Token-2022 mint whose leading bytes happen to look like mint + owner
+    const lookalike = (size: number, typeByte: number) => {
+      const b = Buffer.alloc(size)
+      tokenAccountData(MINT, ALICE, 1n << 60n).copy(b)
+      b[ACCOUNT_SIZE] = typeByte
+      return b
+    }
+    expect(decodeTokenAccountAmount(lookalike(355, AccountType.Account), MINT, ALICE)).toBeNull()
+    expect(decodeTokenAccountAmount(lookalike(200, AccountType.Mint), MINT, ALICE)).toBeNull()
+    expect(decodeTokenAccountAmount(lookalike(200, AccountType.Account), MINT, ALICE)).toBe(1n << 60n)
   })
 
   it('getTokenBalance sums every account of the owner for the mint', async () => {
     const { conn, client } = setup()
-    conn.ownerAccounts.set(ALICE.toBase58(), [
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, ALICE, 10n, true)),
-      account(TOKEN_2022_PROGRAM_ID, tokenAccountData(MINT, ALICE, 5n)),
-    ])
+    putToken(conn, seeded(100).publicKey, ALICE, 10n, { ext: true })
+    putToken(conn, seeded(101).publicKey, ALICE, 5n)
     expect(await client.getTokenBalance(ALICE.toBase58(), MINT.toBase58(), 'finalized')).toEqual({
       value: 15n,
       slot: conn.slot - 3,
@@ -783,6 +1136,142 @@ describe('getHoldings', () => {
       value: 0n,
       slot: conn.slot - 3,
     })
+  })
+})
+
+describe('getAtaBalance', () => {
+  it('reads the owner’s ATA only, at the answering slot', async () => {
+    const { conn, client } = setup()
+    putToken(conn, ata(ALICE), ALICE, 500n, { ext: true })
+    putToken(conn, seeded(60).publicKey, ALICE, 20n) // not the ATA → ignored
+    expect(await client.getAtaBalance(ALICE.toBase58(), MINT.toBase58())).toEqual({
+      value: 500n,
+      slot: conn.slot,
+    })
+    const call = conn.callsTo('getAccountInfoAndContext')[0]!
+    expect(call.args).toEqual([ata(ALICE).toBase58(), 'confirmed'])
+    await client.getAtaBalance(ALICE.toBase58(), MINT.toBase58(), 'finalized')
+    expect(conn.callsTo('getAccountInfoAndContext')[1]!.args[1]).toBe('finalized')
+  })
+
+  it('is 0 when the ATA is missing, not the owner’s, frozen, or not a token account', async () => {
+    const { conn, client } = setup()
+    const dave = seeded(6).publicKey
+    const erin = seeded(7).publicKey
+    const frank = seeded(8).publicKey
+    putToken(conn, ata(erin), ALICE, 999n) // owner field reassigned
+    putToken(conn, ata(dave), dave, 50n, { state: AccountState.Frozen })
+    conn.accounts.set(
+      ata(frank).toBase58(),
+      account(SystemProgram.programId, tokenAccountData(MINT, frank, 7n)),
+    )
+    for (const o of [BOB, erin, dave, frank]) {
+      expect(await client.getAtaBalance(o.toBase58(), MINT.toBase58())).toEqual({
+        value: 0n,
+        slot: conn.slot,
+      })
+    }
+  })
+
+  it('derives the ATA with the mint’s own program', async () => {
+    const { conn, client } = setup()
+    putToken(conn, ata(ALICE, LEGACY_MINT, TOKEN_PROGRAM_ID), ALICE, 9n, { mint: LEGACY_MINT })
+    expect((await client.getAtaBalance(ALICE.toBase58(), LEGACY_MINT.toBase58())).value).toBe(9n)
+  })
+})
+
+describe('getOwnerTokenDeltas', () => {
+  const bal = (accountIndex: number, owner: PublicKey | undefined, amount: bigint, mint = MINT) => ({
+    accountIndex,
+    mint: mint.toBase58(),
+    ...(owner ? { owner: owner.toBase58() } : {}),
+    uiTokenAmount: { amount: amount.toString(), decimals: 6, uiAmount: null, uiAmountString: '' },
+  })
+
+  function txResponse(meta: object | null) {
+    return { slot: 4_321, blockTime: null, transaction: { message: {}, signatures: ['sig'] }, meta }
+  }
+
+  it('nets post − pre over every token account of the owner, per mint', async () => {
+    const { conn, client } = setup()
+    conn.txs.set(
+      'swap-sig',
+      txResponse({
+        fee: 5_000,
+        err: null,
+        preBalances: [],
+        postBalances: [],
+        preTokenBalances: [
+          bal(1, ALICE, 100n), //                     +50
+          bal(2, ALICE, 20n), //                      closed in the tx: post = 0 → −20
+          bal(3, BOB, 50n), //                        not Alice's
+          bal(4, ALICE, 5n, LEGACY_MINT), //          unchanged → omitted
+          bal(6, ALICE, 10n), //                      moved to Bob in the tx → −10 for Alice
+          bal(7, ALICE, 1_000n, LEGACY_MINT), //      −400 of the other mint
+        ],
+        postTokenBalances: [
+          bal(1, ALICE, 150n),
+          bal(3, BOB, 0n),
+          bal(4, ALICE, 5n, LEGACY_MINT),
+          bal(5, ALICE, 30n), //                      created in the tx: pre = 0 → +30
+          bal(6, BOB, 10n),
+          bal(7, ALICE, 600n, LEGACY_MINT),
+        ],
+      }),
+    )
+    const res = await client.getOwnerTokenDeltas('swap-sig', ALICE.toBase58())
+    expect(res).toEqual({
+      signature: 'swap-sig',
+      slot: 4_321,
+      err: null,
+      deltas: new Map([
+        [MINT.toBase58(), 50n - 20n - 10n + 30n],
+        [LEGACY_MINT.toBase58(), -400n],
+      ]),
+    })
+    const bob = await client.getOwnerTokenDeltas('swap-sig', BOB.toBase58())
+    expect(bob!.deltas).toEqual(new Map([[MINT.toBase58(), -50n + 10n]]))
+    expect(conn.callsTo('getTransaction')[0]!.args).toEqual([
+      'swap-sig',
+      { commitment: 'confirmed', maxSupportedTransactionVersion: 0 },
+    ])
+  })
+
+  it('renders a failed tx’s error (its balances did not move); null for an unknown signature', async () => {
+    const { conn, client } = setup()
+    conn.txs.set(
+      'failed',
+      txResponse({
+        err: { InstructionError: [3, { Custom: 1 }] },
+        preTokenBalances: [bal(1, ALICE, 100n)],
+        postTokenBalances: [bal(1, ALICE, 100n)],
+      }),
+    )
+    const res = await client.getOwnerTokenDeltas('failed', ALICE.toBase58())
+    expect(res!.err).toContain('custom program error: 0x1')
+    expect(res!.deltas.size).toBe(0)
+    expect(await client.getOwnerTokenDeltas('unknown', ALICE.toBase58())).toBeNull()
+  })
+
+  it('never guesses: missing meta, token balances or owners are transient', async () => {
+    const { conn, client } = setup()
+    conn.txs.set('no-meta', txResponse(null))
+    conn.txs.set('no-balances', txResponse({ err: null, preTokenBalances: null, postTokenBalances: [] }))
+    conn.txs.set(
+      'no-owner',
+      txResponse({ err: null, preTokenBalances: [bal(1, undefined, 1n)], postTokenBalances: [] }),
+    )
+    for (const sig of ['no-meta', 'no-balances', 'no-owner']) {
+      await expect(client.getOwnerTokenDeltas(sig, ALICE.toBase58())).rejects.toBeInstanceOf(
+        TransientChainError,
+      )
+    }
+    conn.getTransaction = async () => {
+      throw new Error('fetch failed')
+    }
+    await expect(client.getOwnerTokenDeltas('x', ALICE.toBase58())).rejects.toBeInstanceOf(
+      TransientChainError,
+    )
   })
 })
 
@@ -829,22 +1318,27 @@ describe('signature statuses', () => {
 })
 
 describe('estimatePriorityFee', () => {
-  it('uses the 75th percentile of non-zero recent fees with a 1,000 floor', async () => {
+  it('uses the 75th percentile of non-zero GLOBAL recent fees with a 1,000 floor', async () => {
     const { conn, client } = setup()
     conn.prioritizationFees = [0, 0, 100, 2_000, 3_000, 4_000, 5_000]
     expect(await client.estimatePriorityFee()).toBe(4_000)
-    const cfg = conn.callsTo('getRecentPrioritizationFees')[0]!.args[0] as {
-      lockedWritableAccounts: PublicKey[]
-    }
-    expect(cfg.lockedWritableAccounts.map((k) => k.toBase58())).toEqual([
-      PRIZE.publicKey.toBase58(),
-      TOKEN_2022_PROGRAM_ID.toBase58(),
-    ])
+    // no account filter: the market's recent fees, not just txs that happened to lock PRIZE
+    const call = conn.callsTo('getRecentPrioritizationFees')[0]!
+    expect(call.args[0]).toBeUndefined()
     conn.prioritizationFees = [0, 0, 0]
     expect(await client.estimatePriorityFee()).toBe(1_000)
     conn.prioritizationFees = [10, 20]
     expect(await client.estimatePriorityFee()).toBe(1_000)
     expect(percentile75NonZero([1, 2, 3, 4])).toBe(3)
+    expect(percentile75NonZero([0, 7_000, 1_000, 3_000, 2_000, 0])).toBe(3_000)
+  })
+
+  it('returns the configured fallback when the RPC cannot answer', async () => {
+    const { conn, client } = setup()
+    conn.getRecentPrioritizationFees = async () => {
+      throw new Error('503 Service Unavailable')
+    }
+    expect(await client.estimatePriorityFee()).toBe(20_000)
   })
 
   it('prefers the Helius estimate on Helius endpoints and falls back when it fails', async () => {

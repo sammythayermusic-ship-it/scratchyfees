@@ -8,6 +8,7 @@ import {
   type ChainClient,
   type Commitment,
   type MintInfo,
+  type OwnerTokenDeltas,
   type ParsedPayoutTx,
   type SignatureStatuses,
   type SimulationResult,
@@ -47,6 +48,10 @@ export interface MemoryFaults {
   simulateErrorNext?: { count: number; error: string; permanent: boolean }
   /** every RPC read throws (transient) — to exercise retry paths */
   rpcDown?: boolean
+  /** landed txs report confirmationStatus 'processed' for this many slots after landing (lagging backend) */
+  processedWindowSlots?: number
+  /** buildTransferTx sleeps this long (ms) — simulates a slow RPC so leases can expire mid-build */
+  buildDelayMs?: number
 }
 
 interface MemTx {
@@ -100,6 +105,11 @@ export class MemoryChainClient implements ChainClient {
   private readonly atas = new Set<string>()
   private readonly txs = new Map<string, MemTx>()
   private readonly history: Delta[] = []
+  private readonly synthetic = new Map<
+    string,
+    { slot: number; owner: string; deltas: Map<string, bigint> }[]
+  >()
+  private builds = 0
   private timer: NodeJS.Timeout | null = null
   /** every sendRaw call (including duplicates) — tests assert re-broadcast behaviour */
   readonly sendLog: string[] = []
@@ -155,6 +165,12 @@ export class MemoryChainClient implements ChainClient {
         if (tx.landAtHeight === this.height && tx.landedSlot === null) this.land(tx)
       }
     }
+  }
+  /** register token deltas for a synthetic (non-transfer) tx such as a memory claim or swap */
+  recordTx(signature: string, owner: string, deltas: Map<string, bigint>): void {
+    const list = this.synthetic.get(signature) ?? []
+    list.push({ slot: this.height, owner, deltas })
+    this.synthetic.set(signature, list)
   }
   txCount(): number {
     return [...this.txs.values()].filter((t) => t.landedSlot !== null && t.err === null).length
@@ -216,6 +232,10 @@ export class MemoryChainClient implements ChainClient {
     return { value, slot }
   }
 
+  async getAtaBalance(owner: string, mint: string, commitment: Commitment = 'confirmed'): Promise<BalanceAt> {
+    return this.getTokenBalance(owner, mint, commitment)
+  }
+
   async getHoldings(owners: string[], mint: string): Promise<BalanceAt<Map<string, bigint>>> {
     this.rpc()
     const out = new Map<string, bigint>()
@@ -231,6 +251,7 @@ export class MemoryChainClient implements ChainClient {
   async buildTransferTx(req: TransferTxRequest): Promise<BuiltTransferTx> {
     this.rpc()
     this.requireMint(req.mint)
+    if (this.faults.buildDelayMs) await new Promise((r) => setTimeout(r, this.faults.buildDelayMs))
     const signerAddress = this.signerAddress(req.signer)
     const blockhash = `mem-bh-${this.height}`
     const lastValidBlockHeight = this.height + this.validityBlocks
@@ -240,6 +261,8 @@ export class MemoryChainClient implements ChainClient {
       signerAddress,
       blockhash,
       lastValidBlockHeight,
+      // a real blockhash changes every ~400 ms, so two builds never produce identical bytes
+      build: ++this.builds,
     })
     const signature = bs58.encode(sha256(utf8ToBytes(body)))
     return {
@@ -291,11 +314,19 @@ export class MemoryChainClient implements ChainClient {
     return {
       contextSlot,
       statuses: signatures.map((s) => {
+        const syn = this.synthetic.get(s)
+        if (syn) return { slot: syn[0]!.slot, confirmationStatus: 'finalized' as const, err: null }
         const tx = this.txs.get(s)
         if (!tx || tx.landedSlot === null || tx.landedSlot > contextSlot) return null
+        const processedUntil = tx.landedSlot + (this.faults.processedWindowSlots ?? 0)
         return {
           slot: tx.landedSlot,
-          confirmationStatus: tx.landedSlot <= finalized ? 'finalized' : 'confirmed',
+          confirmationStatus:
+            this.height < processedUntil
+              ? 'processed'
+              : tx.landedSlot <= finalized
+                ? 'finalized'
+                : 'confirmed',
           err: tx.err,
         }
       }),
@@ -319,6 +350,31 @@ export class MemoryChainClient implements ChainClient {
       senderDeltaRaw: tx.err ? 0n : tx.senderDelta,
       recipientOwner: tx.req.recipient,
     }
+  }
+
+  async getOwnerTokenDeltas(signature: string, owner: string): Promise<OwnerTokenDeltas | null> {
+    this.rpc()
+    const syn = this.synthetic.get(signature)
+    if (syn) {
+      const deltas = new Map<string, bigint>()
+      let slot = 0
+      for (const e of syn) {
+        if (e.owner !== owner) continue
+        slot = e.slot
+        for (const [m, v] of e.deltas) deltas.set(m, (deltas.get(m) ?? 0n) + v)
+      }
+      return { signature, slot: slot || syn[0]!.slot, err: null, deltas }
+    }
+    const tx = this.txs.get(signature)
+    if (!tx || tx.landedSlot === null) return null
+    const deltas = new Map<string, bigint>()
+    if (!tx.err) {
+      if (tx.req.recipient === owner)
+        deltas.set(tx.req.mint, (deltas.get(tx.req.mint) ?? 0n) + tx.recipientDelta)
+      if (tx.signerAddress === owner)
+        deltas.set(tx.req.mint, (deltas.get(tx.req.mint) ?? 0n) + tx.senderDelta)
+    }
+    return { signature, slot: tx.landedSlot, err: tx.err, deltas }
   }
 
   // ── internals ──────────────────────────────────────────────────────────────

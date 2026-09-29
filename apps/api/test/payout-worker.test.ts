@@ -3,8 +3,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { AlertEvent, Alerter } from '../src/alerts/types'
 import { MemoryChainClient } from '../src/chain/memory'
 import type { Database } from '../src/db/client'
-import { payoutAttempts, payouts, prizeLedger, wallets } from '../src/db/schema'
-import { MAX_ATTEMPTS, PayoutWorker, type PayoutGate } from '../src/payouts/worker'
+import { jackpot, payoutAttempts, payouts, prizeLedger, wallets } from '../src/db/schema'
+import {
+  ABSENCE_RECHECK_MS,
+  LEASE_MS,
+  MAX_ATTEMPTS,
+  PayoutWorker,
+  STUCK_SIM_FAILURES,
+  type GateHold,
+  type PayoutGate,
+} from '../src/payouts/worker'
 import { freshDatabase } from './helpers/db'
 
 const PRIZE = 'PrizeWallet1111111111111111111111111111111'
@@ -21,13 +29,21 @@ class TestAlerter implements Alerter {
 }
 
 class TestGate implements PayoutGate {
-  hold: string | null = null
+  held: GateHold | null = null
   trouble: string[] = []
-  globalHold() {
-    return this.hold
+  stuck: string[] = []
+  doublePays: string[] = []
+  hold() {
+    return this.held
   }
   onBalanceTrouble(kind: 'low_gas' | 'low_pool') {
     this.trouble.push(kind)
+  }
+  onStuck(d: string) {
+    this.stuck.push(d)
+  }
+  onDoublePay(d: string) {
+    this.doublePays.push(d)
   }
 }
 
@@ -37,8 +53,9 @@ let alerter: TestAlerter
 let gate: TestGate
 let clock: number
 
-function worker(id = 'w1') {
+function worker(id = 'w1', ataRecreateLimit = 0) {
   return new PayoutWorker({
+    ataRecreateLimit,
     db: database.db,
     chain,
     alerter,
@@ -196,12 +213,12 @@ describe('payout worker — exactly once', () => {
     const inFlight = await queue(ALICE, 10n)
     const w = worker()
     await w.tick() // attempt sent
-    gate.hold = 'manual'
+    gate.held = { reason: 'manual', hard: true }
     const waiting = await queue(BOB, 20n)
     await drive(w, 4)
     expect((await payout(inFlight.id)).status).toBe('confirmed')
     expect((await payout(waiting.id)).status).toBe('queued')
-    gate.hold = null
+    gate.held = null
     await drive(w, 4)
     expect((await payout(waiting.id)).status).toBe('confirmed')
   })
@@ -242,5 +259,158 @@ describe('payout worker — exactly once', () => {
     const paid =
       (await chain.getTokenBalance(ALICE, MINT)).value + (await chain.getTokenBalance(BOB, MINT)).value
     expect(paid).toBe(expected)
+  })
+})
+
+const CREATOR = 'CreatorWallet111111111111111111111111111111'
+const OPS = 'OpsWallet1111111111111111111111111111111111'
+
+async function attemptsOf(id: bigint) {
+  return database.db
+    .select()
+    .from(payoutAttempts)
+    .where(eq(payoutAttempts.payoutId, id))
+    .orderBy(payoutAttempts.attempt)
+}
+
+describe('payout worker — review regressions (exactly-once under races and slow RPC)', () => {
+  it('a lease that expires mid-build: the slow worker discards its tx unsent; exactly one transfer', async () => {
+    const p = await queue(ALICE, 3_333n)
+    let entered!: () => void
+    const inBuild = new Promise<void>((r) => (entered = r))
+    const build = chain.buildTransferTx.bind(chain)
+    chain.buildTransferTx = (req) => {
+      entered()
+      return build(req)
+    }
+    chain.faults.buildDelayMs = 400
+    const w1 = worker('w1')
+    const w2 = worker('w2')
+    const slow = w1.tick()
+    await inBuild // w1 holds the lease and is inside a slow RPC build
+    chain.faults.buildDelayMs = 0
+    clock += LEASE_MS + 1_000 // its lease runs out while it waits
+    await w2.tick() // w2 takes over, persists + sends attempt 1
+    await slow // w1 wakes up: the fenced persist must refuse its (different) bytes
+    for (let i = 0; i < 5; i++) {
+      await Promise.all([w1.tick(), w2.tick()])
+      chain.advance(1)
+      clock += 2_000
+    }
+    expect((await payout(p.id)).status).toBe('confirmed')
+    expect(await attemptsOf(p.id)).toHaveLength(1)
+    expect(chain.txCount()).toBe(1)
+    expect((await chain.getTokenBalance(ALICE, MINT)).value).toBe(3_333n)
+  })
+
+  it("a landed tx still reported as 'processed' past its expiry is waited on, never rebuilt", async () => {
+    const p = await queue(ALICE, 808n)
+    chain.faults.processedWindowSlots = 40 // lands, but the status view says 'processed' for 40 slots
+    const w = worker()
+    await drive(w, 25, 1, 2_000) // well past lastValidBlockHeight (validity 10) and the absence recheck window
+    expect(await attemptsOf(p.id)).toHaveLength(1)
+    expect((await payout(p.id)).status).toBe('sending')
+    await drive(w, 25, 1, 2_000)
+    expect((await payout(p.id)).status).toBe('confirmed')
+    expect(await attemptsOf(p.id)).toHaveLength(1)
+    expect(chain.txCount()).toBe(1)
+  })
+
+  it(`an expired attempt needs two null proofs ≥${ABSENCE_RECHECK_MS / 1000}s apart before a rebuild`, async () => {
+    const p = await queue(BOB, 1_234n)
+    chain.faults.dropNext = 1
+    const w = worker()
+    await drive(w, 16, 1, 250) // past expiry, but only ~4s of wall clock
+    let attempts = await attemptsOf(p.id)
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]!.absentSince).toBeTruthy() // first proof recorded
+    clock += ABSENCE_RECHECK_MS
+    await drive(w, 6, 1, 2_000)
+    attempts = await attemptsOf(p.id)
+    expect(attempts.map((a) => a.status)).toEqual(['expired', 'landed'])
+    expect((await payout(p.id)).status).toBe('confirmed')
+    expect(chain.txCount()).toBe(1)
+  })
+
+  it(`${STUCK_SIM_FAILURES} consecutive failed simulations of a PRIZE payout → gate.onStuck (hard pause)`, async () => {
+    const p = await queue(ALICE, 55n)
+    chain.faults.simulateErrorNext = {
+      count: 100,
+      error: 'instruction 4: custom program error: 0x1f',
+      permanent: false,
+    }
+    await drive(worker(), STUCK_SIM_FAILURES + 2, 1, 70_000)
+    expect(gate.stuck.length).toBeGreaterThan(0)
+    expect(gate.stuck[0]).toContain(`#${p.id}`)
+    expect((await payout(p.id)).status).not.toBe('failed_permanent') // never silently given up
+    expect(chain.txCount()).toBe(0)
+  })
+
+  it('ATA re-creation: rent is paid again (Decision D), alerts on repeats, and ATA_RECREATE_LIMIT holds when set', async () => {
+    const w = worker('w1', 2)
+    const a = await queue(ALICE, 10n)
+    await drive(w, 4)
+    expect((await payout(a.id)).ataCreated).toBe(true)
+    const sellAndClose = async () => {
+      chain.transferExternal(ALICE, BOB, MINT, (await chain.getTokenBalance(ALICE, MINT)).value)
+      chain.closeAta(ALICE, MINT)
+    }
+    await sellAndClose()
+    const b = await queue(ALICE, 11n)
+    await drive(w, 4)
+    expect((await payout(b.id)).status).toBe('confirmed')
+    expect((await payout(b.id)).ataCreated).toBe(true)
+    expect(alerter.events.some((e) => e.kind === 'payout.ata_recreated')).toBe(true)
+    await sellAndClose()
+    const c = await queue(ALICE, 12n)
+    await drive(w, 4)
+    const held = await payout(c.id)
+    expect(held.status).toBe('queued')
+    expect(held.error).toMatch(/ATA_RECREATE_LIMIT/)
+    expect(chain.txCount()).toBe(2)
+  })
+
+  it('a jackpot payout that can never succeed returns its amount to the pot (Decision B)', async () => {
+    await database.db.insert(jackpot).values({ id: 1, amountRaw: 5_000n, seeded: true })
+    const [p] = await database.db
+      .insert(payouts)
+      .values({ kind: 'jackpot', wallet: ALICE, amountRaw: 90_000n, roundId: 1, status: 'queued' })
+      .returning()
+    chain.faults.simulateErrorNext = { count: 1, error: 'AccountFrozen', permanent: true }
+    await drive(worker(), 2)
+    expect((await payout(p!.id)).status).toBe('failed_permanent')
+    const [pot] = await database.db.select().from(jackpot).where(eq(jackpot.id, 1))
+    expect(pot!.amountRaw).toBe(95_000n)
+  })
+
+  it('a hard hold stops sweep transfers INTO the PRIZE wallet but lets the OPS leg move; a soft hold stops neither', async () => {
+    await database.close()
+    database = await freshDatabase()
+    chain = new MemoryChainClient({
+      prizeAddress: PRIZE,
+      creatorAddress: CREATOR,
+      mints: [{ address: MINT, decimals: 6, token2022: true }],
+      validityBlocks: 10,
+      finalityLag: 2,
+      landingDelay: 1,
+    })
+    chain.setSol(CREATOR, 1_000_000_000n)
+    chain.credit(CREATOR, MINT, 1_000_000n)
+    const sweep = (kind: string, wallet: string, amountRaw: bigint) =>
+      database.db
+        .insert(payouts)
+        .values({ kind, signer: 'creator', wallet, amountRaw, roundId: 0, status: 'queued' })
+        .returning()
+    const [toPrize] = await sweep('sweep_prize', PRIZE, 700n)
+    const [toOps] = await sweep('sweep_ops', OPS, 300n)
+    gate.held = { reason: 'invariant', hard: true }
+    const w = worker()
+    await drive(w, 4)
+    expect((await payout(toOps!.id)).status).toBe('confirmed')
+    expect((await payout(toPrize!.id)).status).toBe('queued')
+    gate.held = { reason: 'low_gas', hard: false }
+    await drive(w, 4)
+    expect((await payout(toPrize!.id)).status).toBe('confirmed')
+    expect((await chain.getTokenBalance(PRIZE, MINT)).value).toBe(700n)
   })
 })

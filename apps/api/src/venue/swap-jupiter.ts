@@ -1,7 +1,14 @@
 import { VersionedTransaction, type Connection, type Keypair } from '@solana/web3.js'
 import bs58 from 'bs58'
-import { assertPositiveAmount, assertSlippageBps, minOutWithSlippage } from './send'
-import type { SwapAdapter, SwapResult } from './types'
+import {
+  assertPositiveAmount,
+  assertSlippageBps,
+  minOutWithSlippage,
+  swapResultFromDeltas,
+  txOwnerTokenDeltas,
+  type TxDeltaOptions,
+} from './send'
+import type { OnSwapSigned, SwapAdapter, SwapResult } from './types'
 
 /**
  * SCRATCHY → PUMP through Jupiter Swap API v2 (PLAN §3 "swap the $SCRATCHY side to PUMP via Jupiter
@@ -10,13 +17,17 @@ import type { SwapAdapter, SwapResult } from './types'
  *   GET  {base}/swap/v2/order?inputMint&outputMint&amount&taker&slippageBps   (slippageBps ALWAYS explicit)
  *        → { transaction (base64 v0 tx; null/"" on error), requestId, inputMint, outputMint, inAmount,
  *            outAmount, otherAmountThreshold, errorCode, errorMessage, … }
- *   sign the VersionedTransaction as `taker`
+ *   sign the VersionedTransaction as `taker` → onSigned(signature) → only then:
  *   POST {base}/swap/v2/execute { signedTransaction, requestId }
- *        → { status: "Success" | "Failed", signature, code, error, totalInputAmount, totalOutputAmount }
+ *        → { status: "Success" | "Failed", signature, code, error, … }
  *
  * Nothing is signed unless the order is exactly what we asked for: same mints, same input amount,
- * ExactIn, a minimum-out no looser than our slippage cap, and a transaction that actually needs our
- * signature. in/out come from execute's totals; the signature is then confirmed on our own RPC.
+ * ExactIn, a minimum-out no looser than our slippage cap, a transaction that needs our signature AND whose
+ * fee payer is the taker (gasless / Jupiter-paid orders are refused: with the taker as fee payer OUR
+ * signature is the transaction id, so the sweeper can persist and later resolve it before anything is sent).
+ * After /execute the signature is confirmed on our own RPC and in/out are booked from the confirmed tx's own
+ * token-balance meta (never from execute's totals or balance reads). Every throw after onSigned is a
+ * JupiterSwapError carrying our signature: the swap may have landed.
  * The optional API key is sent only as the `x-api-key` header and never appears in errors.
  */
 
@@ -26,9 +37,15 @@ export const JUPITER_ORDER_TIMEOUT_MS = 15_000
 /** /execute waits for the swap to land */
 export const JUPITER_EXECUTE_TIMEOUT_MS = 60_000
 
+/**
+ * Our RPC may lag Jupiter's by a few blocks, so a lastValidBlockHeight derived from OUR latest blockhash gets
+ * this margin; an over-estimate only delays the sweeper's expiry proof, an under-estimate could fake one.
+ */
+export const JUPITER_EXPIRY_MARGIN_BLOCKS = 32
+
 export interface JupiterSwapOptions {
-  /** used only to confirm execute's signature on our own RPC */
-  connection: Pick<Connection, 'getSignatureStatuses'>
+  /** our own RPC: expiry height for onSigned, confirmation of the signature, and the tx meta to book from */
+  connection: Pick<Connection, 'getSignatureStatuses' | 'getLatestBlockhash' | 'getTransaction'>
   /** taker (CREATOR): holds the SCRATCHY and signs */
   owner: Keypair
   /** API origin, e.g. https://api.jup.ag (JUPITER_API_BASE) */
@@ -45,15 +62,18 @@ export interface JupiterSwapOptions {
   confirmPolls?: number
   confirmPollMs?: number
   sleep?: (ms: number) => Promise<void>
+  /** getTransaction retries while booking from the tx meta */
+  deltaOptions?: TxDeltaOptions
 }
 
 export class JupiterSwapError extends Error {
   constructor(
     message: string,
-    /** set once a transaction may have been submitted (execute reached) */
+    /** always set once the transaction is signed and handed to onSigned (it may have been submitted) */
     readonly signature: string | null = null,
+    cause?: unknown,
   ) {
-    super(message)
+    super(message, cause === undefined ? undefined : { cause })
     this.name = 'JupiterSwapError'
   }
 }
@@ -64,6 +84,16 @@ function parseUint(v: unknown, field: string): bigint {
   if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return BigInt(v)
   if (typeof v === 'string' && UINT_RE.test(v)) return BigInt(v)
   throw new JupiterSwapError(`Jupiter: missing/invalid ${field} (${JSON.stringify(v)})`)
+}
+
+/** lenient: a positive integer (number or decimal string) or null */
+function optionalHeight(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isSafeInteger(v) && v > 0) return v
+  if (typeof v === 'string' && UINT_RE.test(v)) {
+    const n = Number(v)
+    return Number.isSafeInteger(n) && n > 0 ? n : null
+  }
+  return null
 }
 
 function snippet(v: unknown): string {
@@ -127,7 +157,12 @@ export interface ValidatedOrder {
   tx: VersionedTransaction
   outAmount: bigint
   otherAmountThreshold: bigint
+  /** the order's own lastValidBlockHeight, when it reports one */
+  lastValidBlockHeight: number | null
 }
+
+/** order fields that name who pays the transaction fee (any of them ≠ taker = gasless / sponsored) */
+const FEE_PAYER_FIELDS = ['feePayer', 'signatureFeePayer', 'prioritizationFeePayer'] as const
 
 /** Refuse anything that isn't exactly the order we asked for (pure; exported for tests). */
 export function validateOrder(order: Record<string, unknown>, want: OrderExpectation): ValidatedOrder {
@@ -196,7 +231,32 @@ export function validateOrder(order: Record<string, unknown>, want: OrderExpecta
       `Jupiter order transaction does not require the taker ${want.taker} as a signer`,
     )
   }
-  return { requestId, tx, outAmount, otherAmountThreshold }
+  // gasless / sponsored orders: someone else's signature would be the tx id, so ours couldn't be persisted
+  // and resolved before submission — refuse them
+  if (order.gasless === true || order.gasless === 'true') {
+    throw new JupiterSwapError('Jupiter order is gasless (fee payer is not the taker); refusing to sign')
+  }
+  if (signers[0] !== want.taker) {
+    throw new JupiterSwapError(
+      `Jupiter order transaction fee payer ${signers[0] ?? 'none'} is not the taker ${want.taker} ` +
+        `(gasless / sponsored order); refusing to sign`,
+    )
+  }
+  for (const f of FEE_PAYER_FIELDS) {
+    const v = order[f]
+    if (typeof v === 'string' && v !== '' && v !== want.taker) {
+      throw new JupiterSwapError(
+        `Jupiter order ${f} ${snippet(v)} is not the taker ${want.taker}; refusing to sign`,
+      )
+    }
+  }
+  return {
+    requestId,
+    tx,
+    outAmount,
+    otherAmountThreshold,
+    lastValidBlockHeight: optionalHeight(order.lastValidBlockHeight),
+  }
 }
 
 export class JupiterSwap implements SwapAdapter {
@@ -229,7 +289,11 @@ export class JupiterSwap implements SwapAdapter {
     return `${this.base}/swap/v2/order?${q.toString()}`
   }
 
-  async swapBaseToQuote(amountInRaw: bigint, maxSlippageBps: number): Promise<SwapResult> {
+  async swapBaseToQuote(
+    amountInRaw: bigint,
+    maxSlippageBps: number,
+    onSigned?: OnSwapSigned,
+  ): Promise<SwapResult> {
     assertPositiveAmount(amountInRaw, 'JupiterSwap')
     assertSlippageBps(maxSlippageBps)
     const taker = this.o.owner.publicKey.toBase58()
@@ -249,11 +313,57 @@ export class JupiterSwap implements SwapAdapter {
       taker,
     })
 
+    // 1. sign (the taker is the fee payer, so its signature IS the transaction id)
     v.tx.sign([this.o.owner])
-    const takerIsFeePayer = v.tx.message.staticAccountKeys[0]?.toBase58() === taker
-    const ourSig = takerIsFeePayer && v.tx.signatures[0] ? bs58.encode(v.tx.signatures[0]) : null
+    const first = v.tx.signatures[0]
+    if (!first || first.every((b) => b === 0)) {
+      throw new JupiterSwapError('Jupiter order transaction has no taker signature after signing')
+    }
+    const signature = bs58.encode(first)
     const signedTransaction = Buffer.from(v.tx.serialize()).toString('base64')
+    const lastValidBlockHeight = await this.expiryHeight(v)
 
+    // 2. hand the signature to the caller; if it can't persist it, nothing is ever submitted
+    await onSigned?.({ signature, lastValidBlockHeight })
+
+    // 3. execute → confirm on our RPC → book from the tx's own meta. Every throw from here on carries it.
+    try {
+      return await this.executeAndBook(v, signature, signedTransaction, amountInRaw)
+    } catch (e) {
+      if (e instanceof JupiterSwapError && e.signature === signature) throw e
+      throw new JupiterSwapError(
+        `Jupiter swap ${signature}: ${(e as Error).message ?? String(e)}; resolve the signature before retrying`,
+        signature,
+        e,
+      )
+    }
+  }
+
+  /**
+   * Upper bound on the block height after which the signed transaction can never land: the order's own
+   * value when reported, and our RPC's latest-blockhash height + margin (the order's blockhash is no newer).
+   */
+  private async expiryHeight(v: ValidatedOrder): Promise<number> {
+    let ours: number | null = null
+    try {
+      ours = (await this.o.connection.getLatestBlockhash('confirmed')).lastValidBlockHeight
+    } catch {
+      ours = null
+    }
+    if (ours === null && v.lastValidBlockHeight === null) {
+      throw new JupiterSwapError(
+        'Jupiter: cannot determine the lastValidBlockHeight of the order transaction (RPC unavailable); not submitting',
+      )
+    }
+    return Math.max(ours === null ? 0 : ours + JUPITER_EXPIRY_MARGIN_BLOCKS, v.lastValidBlockHeight ?? 0)
+  }
+
+  private async executeAndBook(
+    v: ValidatedOrder,
+    signature: string,
+    signedTransaction: string,
+    amountInRaw: bigint,
+  ): Promise<SwapResult> {
     const exec = await requestJson(
       this.fetchImpl,
       `${this.base}/swap/v2/execute`,
@@ -264,32 +374,36 @@ export class JupiterSwap implements SwapAdapter {
       },
       'Jupiter /swap/v2/execute',
       this.o.executeTimeoutMs ?? JUPITER_EXECUTE_TIMEOUT_MS,
-    ).catch((e: unknown) => {
-      // the signed tx may have been submitted: surface our signature so the sweeper can look it up
-      if (e instanceof JupiterSwapError) throw new JupiterSwapError(e.message, ourSig)
-      throw e
-    })
+    )
 
-    const signature = typeof exec.signature === 'string' && exec.signature !== '' ? exec.signature : null
+    const execSig = typeof exec.signature === 'string' && exec.signature !== '' ? exec.signature : null
+    if (execSig && execSig !== signature) {
+      throw new JupiterSwapError(
+        `Jupiter execute signature ${execSig} ≠ the transaction we signed (${signature})`,
+        signature,
+      )
+    }
     if (exec.status !== 'Success') {
       throw new JupiterSwapError(
         `Jupiter execute ${snippet(exec.status ?? null)}: code=${snippet(exec.code ?? null)} ` +
-          `error=${snippet(exec.error ?? null)} signature=${signature ?? ourSig ?? 'none'}`,
-        signature ?? ourSig,
+          `error=${snippet(exec.error ?? null)} signature=${signature}`,
+        signature,
       )
     }
-    if (!signature) throw new JupiterSwapError('Jupiter execute reported Success without a signature', ourSig)
-    if (ourSig && signature !== ourSig) {
-      throw new JupiterSwapError(
-        `Jupiter execute signature ${signature} ≠ the transaction we signed (${ourSig})`,
-        ourSig,
-      )
-    }
-    const inRaw = parseUint(exec.totalInputAmount ?? exec.inputAmountResult, 'totalInputAmount')
-    const outRaw = parseUint(exec.totalOutputAmount ?? exec.outputAmountResult, 'totalOutputAmount')
 
     await this.confirmOnOurRpc(signature)
-    return { signature, inRaw, outRaw }
+    const deltas = await txOwnerTokenDeltas(
+      this.o.connection,
+      signature,
+      this.o.owner.publicKey,
+      this.o.deltaOptions,
+    )
+    return swapResultFromDeltas(signature, deltas, {
+      baseMint: this.o.inputMint,
+      quoteMint: this.o.outputMint,
+      amountInRaw,
+      minOutRaw: v.otherAmountThreshold,
+    })
   }
 
   /** Don't take the API's word for it: the signature must be confirmed (and error-free) on our RPC. */
@@ -315,7 +429,7 @@ export class JupiterSwap implements SwapAdapter {
       if (i < polls - 1) await this.sleep(pollMs)
     }
     throw new JupiterSwapError(
-      `Jupiter reported Success for ${signature} but our RPC hasn't confirmed it; re-measure balances`,
+      `Jupiter reported Success for ${signature} but our RPC hasn't confirmed it; resolve the signature before retrying`,
       signature,
     )
   }

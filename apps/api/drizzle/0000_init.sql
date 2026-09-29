@@ -14,6 +14,7 @@ CREATE TABLE "entries" (
 	"weighted_micro" bigint NOT NULL,
 	"session_id" text,
 	"lock_expires_at" timestamp with time zone,
+	"last_scratch_at" timestamp with time zone,
 	"voided_at" timestamp with time zone,
 	"void_reason" text,
 	CONSTRAINT "entries_round_id_wallet_pk" PRIMARY KEY("round_id","wallet")
@@ -48,7 +49,8 @@ CREATE TABLE "payout_attempts" (
 	"landed_slot" bigint,
 	"error" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	"last_sent_at" timestamp with time zone
+	"last_sent_at" timestamp with time zone,
+	"absent_since" timestamp with time zone
 );
 --> statement-breakpoint
 CREATE TABLE "payouts" (
@@ -65,6 +67,7 @@ CREATE TABLE "payouts" (
 	"landed_slot" bigint,
 	"ata_created" boolean,
 	"rebuilds" integer DEFAULT 0 NOT NULL,
+	"sim_failures" integer DEFAULT 0 NOT NULL,
 	"next_attempt_at" timestamp with time zone,
 	"lease_owner" text,
 	"lease_expires_at" timestamp with time zone,
@@ -142,6 +145,10 @@ CREATE TABLE "sweeps" (
 	"to_prize_raw" bigint DEFAULT 0 NOT NULL,
 	"to_ops_raw" bigint DEFAULT 0 NOT NULL,
 	"tx_sigs" jsonb DEFAULT '[]'::jsonb NOT NULL,
+	"creator_scratchy_baseline_raw" bigint,
+	"swap_sig" text,
+	"swap_last_valid_block_height" bigint,
+	"swap_intent_in_raw" bigint,
 	"error" text,
 	"at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
@@ -178,6 +185,7 @@ ALTER TABLE "round_secrets" ADD CONSTRAINT "round_secrets_round_id_rounds_id_fk"
 ALTER TABLE "tickets" ADD CONSTRAINT "tickets_round_id_rounds_id_fk" FOREIGN KEY ("round_id") REFERENCES "public"."rounds"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "events_kind_idx" ON "events" USING btree ("kind","at");--> statement-breakpoint
 CREATE UNIQUE INDEX "payout_attempts_sig_uq" ON "payout_attempts" USING btree ("signature");--> statement-breakpoint
+CREATE UNIQUE INDEX "payout_attempts_payout_attempt_uq" ON "payout_attempts" USING btree ("payout_id","attempt");--> statement-breakpoint
 CREATE INDEX "payout_attempts_payout_idx" ON "payout_attempts" USING btree ("payout_id");--> statement-breakpoint
 CREATE INDEX "payouts_status_idx" ON "payouts" USING btree ("status","next_attempt_at");--> statement-breakpoint
 CREATE INDEX "payouts_wallet_idx" ON "payouts" USING btree ("wallet");--> statement-breakpoint

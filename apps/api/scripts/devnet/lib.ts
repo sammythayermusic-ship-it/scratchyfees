@@ -21,10 +21,10 @@ import {
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
-  PublicKey,
   SendTransactionError,
   SystemProgram,
   Transaction,
+  type PublicKey,
   type Signer,
 } from '@solana/web3.js'
 import bs58 from 'bs58'
@@ -60,7 +60,10 @@ export function classifyCluster(genesisHash: string, rpcUrl: string, localnetFla
   if (genesisHash === DEVNET_GENESIS_HASH) return { ok: true, cluster: 'devnet' }
   const forbidden = FORBIDDEN_GENESIS[genesisHash]
   if (forbidden) {
-    return { ok: false, reason: `the RPC serves ${forbidden} (genesis ${genesisHash}); these scripts are devnet-only` }
+    return {
+      ok: false,
+      reason: `the RPC serves ${forbidden} (genesis ${genesisHash}); these scripts are devnet-only`,
+    }
   }
   if (!localnetFlag) {
     return {
@@ -287,7 +290,11 @@ export function emptyState(cluster: DevnetCluster, genesisHash: string): DevnetS
 }
 
 /** Load the state for this cluster; refuses a state written against another genesis (e.g. a devnet reset). */
-export function loadState(cluster: DevnetCluster, genesisHash: string, path = statePath(cluster)): DevnetState {
+export function loadState(
+  cluster: DevnetCluster,
+  genesisHash: string,
+  path = statePath(cluster),
+): DevnetState {
   if (!existsSync(path)) return emptyState(cluster, genesisHash)
   let state: DevnetState
   try {
@@ -352,19 +359,30 @@ export function ceilToCentiSol(lamports: bigint): bigint {
  * DAMM v2 sqrtPrice (Q64.64 of raw-B per raw-A) → whole-quote per whole-base × 1e18.
  * price_raw = sqrtPrice² / 2^128;  price_whole = price_raw × 10^(decA − decB).
  */
-export function priceE18FromSqrtPrice(sqrtPriceX64: bigint, baseDecimals: number, quoteDecimals: number): bigint {
-  return (sqrtPriceX64 * sqrtPriceX64 * 10n ** BigInt(18 + baseDecimals)) / (Q128 * 10n ** BigInt(quoteDecimals))
+export function priceE18FromSqrtPrice(
+  sqrtPriceX64: bigint,
+  baseDecimals: number,
+  quoteDecimals: number,
+): bigint {
+  return (
+    (sqrtPriceX64 * sqrtPriceX64 * 10n ** BigInt(18 + baseDecimals)) / (Q128 * 10n ** BigInt(quoteDecimals))
+  )
 }
 
-/** raw base units worth `usdWhole` dollars at `priceQuotePerBaseE18` × `quoteUsdE18` (floored) */
-export function baseRawForUsd(
-  usdWhole: bigint,
+/**
+ * Smallest raw base amount worth AT LEAST `usdE18` (USD × 1e18) at `priceQuotePerBaseE18` × `quoteUsdE18`.
+ * Rounded up, so a holding sized for a tier boundary (e.g. $600 → 60 tickets) never floors below it.
+ */
+export function baseRawForUsdE18(
+  usdE18: bigint,
   priceQuotePerBaseE18: bigint,
   quoteUsdE18: bigint,
   baseDecimals: number,
 ): bigint {
   if (priceQuotePerBaseE18 <= 0n || quoteUsdE18 <= 0n) throw new Error('prices must be positive')
-  return (usdWhole * 10n ** BigInt(baseDecimals) * E18 * E18) / (priceQuotePerBaseE18 * quoteUsdE18)
+  const num = usdE18 * 10n ** BigInt(baseDecimals) * E18
+  const den = priceQuotePerBaseE18 * quoteUsdE18
+  return (num + den - 1n) / den
 }
 
 /** USD × 1e18 of `baseRaw` base units */
@@ -408,7 +426,11 @@ export async function getSolBalances(conn: Connection, keys: PublicKey[]): Promi
 }
 
 /** token balance of one token account (0 when it does not exist); works for SPL Token and Token-2022 */
-export async function tokenAccountBalance(conn: Connection, account: PublicKey, program: PublicKey): Promise<bigint> {
+export async function tokenAccountBalance(
+  conn: Connection,
+  account: PublicKey,
+  program: PublicKey,
+): Promise<bigint> {
   const info = await conn.getAccountInfo(account, 'confirmed')
   if (!info) return 0n
   return unpackAccount(account, info, program).amount
@@ -474,14 +496,19 @@ export async function sendAndConfirm(
   const signature = bs58.encode(sigBytes)
 
   try {
-    await conn.sendRawTransaction(raw, { skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 0 })
+    await conn.sendRawTransaction(raw, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+      maxRetries: 0,
+    })
   } catch (e) {
     throw await describeSendError(conn, e, opts.label)
   }
   for (;;) {
     const st = (await conn.getSignatureStatuses([signature])).value[0]
     if (st?.err) throw new Error(`${opts.label}: failed on-chain ${JSON.stringify(st.err)} (${signature})`)
-    if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) return signature
+    if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized'))
+      return signature
     const height = await conn.getBlockHeight('confirmed')
     if (height > lastValidBlockHeight) {
       const last = (await conn.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0]
@@ -555,7 +582,10 @@ export interface AirdropOptions {
   exit?: Exit
 }
 
-type AirdropConnection = Pick<Connection, 'getBalance' | 'requestAirdrop' | 'getLatestBlockhash' | 'confirmTransaction'>
+type AirdropConnection = Pick<
+  Connection,
+  'getBalance' | 'requestAirdrop' | 'getLatestBlockhash' | 'confirmTransaction'
+>
 
 /**
  * Top `pubkey` up to `targetLamports` from the devnet faucet: ≤ 1 SOL per request, exponential backoff.
@@ -699,19 +729,24 @@ export interface BudgetRow {
 }
 
 export function printSolBudget(title: string, rows: BudgetRow[], notes: string[] = []): bigint {
-  const shortfall = (r: BudgetRow) => (r.balanceLamports >= r.targetLamports ? 0n : r.targetLamports - r.balanceLamports)
+  const shortfall = (r: BudgetRow) =>
+    r.balanceLamports >= r.targetLamports ? 0n : r.targetLamports - r.balanceLamports
   const total = rows.reduce((s, r) => s + shortfall(r), 0n)
   const target = rows.reduce((s, r) => s + r.targetLamports, 0n)
   const col = (s: string, n: number) => s.padStart(n)
   console.log(`\n══ SOL BUDGET — ${title} ══`)
-  console.log(`  ${'wallet'.padEnd(9)} ${'address'.padEnd(44)} ${col('target', 13)} ${col('balance', 13)} ${col('to fund', 13)}`)
+  console.log(
+    `  ${'wallet'.padEnd(9)} ${'address'.padEnd(44)} ${col('target', 13)} ${col('balance', 13)} ${col('to fund', 13)}`,
+  )
   for (const r of rows) {
     console.log(
       `  ${r.label.padEnd(9)} ${r.address.padEnd(44)} ${col(fmtSol(r.targetLamports), 13)} ` +
         `${col(fmtSol(r.balanceLamports), 13)} ${col(fmtSol(shortfall(r)), 13)}`,
     )
   }
-  console.log(`  ${'TOTAL'.padEnd(9)} ${''.padEnd(44)} ${col(fmtSol(target), 13)} ${''.padStart(13)} ${col(fmtSol(total), 13)}`)
+  console.log(
+    `  ${'TOTAL'.padEnd(9)} ${''.padEnd(44)} ${col(fmtSol(target), 13)} ${''.padStart(13)} ${col(fmtSol(total), 13)}`,
+  )
   for (const n of notes) console.log(`  · ${n}`)
   return total
 }

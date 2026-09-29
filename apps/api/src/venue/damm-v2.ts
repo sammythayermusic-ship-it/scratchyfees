@@ -11,8 +11,12 @@ import {
 import { pow10 } from '@scratchy/core'
 import { getMint } from '@solana/spl-token'
 import type { Connection, Keypair, PublicKey, Signer, Transaction } from '@solana/web3.js'
-import type { BalanceAt } from '../chain/types'
-import { sendAndConfirmSignedWithSlot, type ConfirmedTx } from './send'
+import {
+  sendAndConfirmSignedWithSlot,
+  txOwnerTokenDeltas,
+  type ConfirmedTx,
+  type TxDeltaOptions,
+} from './send'
 import type { ClaimResult, PoolState, VenueAdapter } from './types'
 
 /**
@@ -25,8 +29,9 @@ import type { ClaimResult, PoolState, VenueAdapter } from './types'
  *    20 significant digits; we evaluate it exactly in bigint, then floor once at 1e18. Never a reserve ratio.
  *  - orientation: our pools are tokenA = SCRATCHY (base), tokenB = PUMP (quote); a pool created the other
  *    way round is supported by inverting (price and fee/reserve mapping), validated on first use.
- *  - claimFees: the returned amounts are CREATOR's measured balance deltas around the confirmed claim tx
- *    (NOT the pending estimate); the post-claim read is pinned to a view at/after the landing slot.
+ *  - claimFees: the returned amounts are CREATOR's token deltas from the confirmed claim tx's OWN meta
+ *    (pre/post token balances via getTransaction) — NOT the pending estimate and NOT before/after balance
+ *    reads (unpinned reads on a load-balanced RPC can double-count or miss the claim).
  *
  * SDK-heavy calls are kept behind small functions (loadPoolStatics, pendingFeesFromStates,
  * runMeasuredClaim, …) so the math and orchestration are unit-tested without a cluster; the real
@@ -146,120 +151,63 @@ export function pendingFeesFromStates(
   return { quoteRaw: m.quote, baseRaw: m.base }
 }
 
-// ── balances ─────────────────────────────────────────────────────────────────
-
-/**
- * Total raw balance of `owner` for `mint` across all its token accounts at 'confirmed', answered from a
- * view at or after `minContextSlot` when given.
- */
-export type TokenBalanceReader = (
-  owner: PublicKey,
-  mint: PublicKey,
-  minContextSlot?: number,
-) => Promise<BalanceAt>
-
-const MIN_SLOT_RETRIES = 8
-const MIN_SLOT_RETRY_MS = 500
-
-/** getTokenAccountsByOwner(mint filter — works for SPL and Token-2022) summed; retries a lagging RPC view. */
-export function rpcBalanceReader(
-  connection: Pick<Connection, 'getTokenAccountsByOwner'>,
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-): TokenBalanceReader {
-  return async (owner, mint, minContextSlot) => {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        const res = await connection.getTokenAccountsByOwner(
-          owner,
-          { mint },
-          minContextSlot === undefined
-            ? { commitment: 'confirmed' }
-            : { commitment: 'confirmed', minContextSlot },
-        )
-        let total = 0n
-        for (const { account } of res.value) total += readTokenAmount(account.data)
-        return { value: total, slot: res.context.slot }
-      } catch (e) {
-        const lagging = /minimum context slot/i.test((e as Error).message ?? '')
-        if (!lagging || attempt >= MIN_SLOT_RETRIES) throw e
-        await sleep(MIN_SLOT_RETRY_MS)
-      }
-    }
-  }
-}
-
-export interface BaseQuoteBalances {
-  base: BalanceAt
-  quote: BalanceAt
-}
-
-export function makeBaseQuoteReader(
-  reader: TokenBalanceReader,
-  owner: PublicKey,
-  baseMint: PublicKey,
-  quoteMint: PublicKey,
-): (minContextSlot?: number) => Promise<BaseQuoteBalances> {
-  return async (minContextSlot) => {
-    const [base, quote] = await Promise.all([
-      reader(owner, baseMint, minContextSlot),
-      reader(owner, quoteMint, minContextSlot),
-    ])
-    return { base, quote }
-  }
-}
-
 // ── claim orchestration (unit-tested with stubs) ─────────────────────────────
 
 export class ClaimMeasurementError extends Error {
+  /** the claim transaction (it landed or may have landed): resolve it before doing anything else */
+  readonly signature: string | null
+
   constructor(
     message: string,
     readonly signatures: string[],
+    cause?: unknown,
   ) {
-    super(message)
+    super(message, cause === undefined ? undefined : { cause })
     this.name = 'ClaimMeasurementError'
+    this.signature = signatures[0] ?? null
   }
 }
 
 export interface ClaimSteps {
   pending(): Promise<{ quoteRaw: bigint; baseRaw: bigint }>
-  readBalances(minContextSlot?: number): Promise<BaseQuoteBalances>
+  /** build, sign, send and confirm the claim */
   sendClaim(): Promise<ConfirmedTx>
-  /** a lower bound for the pre-claim read's view (e.g. the slot of this venue's previous tx) */
-  minSlotBefore?: number
+  /** CREATOR's token deltas (raw, per side) from the confirmed claim tx's own meta */
+  claimDeltas(signature: string): Promise<{ quoteRaw: bigint; baseRaw: bigint }>
 }
 
 /**
- * pending == 0 on both sides → no tx, zeros. Otherwise: read CREATOR's balances, claim (confirmed),
- * re-read from a view at/after the landing slot, and return the deltas. A negative delta (something else
- * moved CREATOR's tokens concurrently) or a stale post-claim view throws with the claim signature attached,
- * so the sweeper re-measures instead of trusting a wrong number.
+ * pending == 0 on both sides → no tx, zeros. Otherwise: claim (confirmed) and return CREATOR's deltas read
+ * from that transaction's own pre/post token balances. A negative delta (impossible for a claim) or a
+ * failure to read the tx meta throws ClaimMeasurementError with the claim signature attached, so the
+ * sweeper resolves the signature instead of trusting a wrong number. Errors from sendClaim itself
+ * (VenueTxError) already carry the signature and propagate unchanged.
  */
 export async function runMeasuredClaim(steps: ClaimSteps): Promise<ClaimResult> {
   const pending = await steps.pending()
   if (pending.quoteRaw === 0n && pending.baseRaw === 0n) {
     return { signatures: [], claimedQuoteRaw: 0n, claimedBaseRaw: 0n }
   }
-  const before = await steps.readBalances(steps.minSlotBefore)
   const tx = await steps.sendClaim()
-  const after = await steps.readBalances(tx.slot)
   const sigs = [tx.signature]
-  if (after.base.slot < tx.slot || after.quote.slot < tx.slot) {
+  let deltas: { quoteRaw: bigint; baseRaw: bigint }
+  try {
+    deltas = await steps.claimDeltas(tx.signature)
+  } catch (e) {
     throw new ClaimMeasurementError(
-      `claim ${tx.signature} landed at slot ${tx.slot} but the balance view is older ` +
-        `(base@${after.base.slot}, quote@${after.quote.slot}); re-measure`,
+      `claim ${tx.signature} confirmed but its token deltas could not be read: ${(e as Error).message ?? String(e)}`,
+      sigs,
+      e,
+    )
+  }
+  if (deltas.quoteRaw < 0n || deltas.baseRaw < 0n) {
+    throw new ClaimMeasurementError(
+      `claim ${tx.signature}: CREATOR balance dropped in the claim tx ` +
+        `(PUMP Δ${deltas.quoteRaw}, SCRATCHY Δ${deltas.baseRaw}) — refusing to book it`,
       sigs,
     )
   }
-  const claimedQuoteRaw = after.quote.value - before.quote.value
-  const claimedBaseRaw = after.base.value - before.base.value
-  if (claimedQuoteRaw < 0n || claimedBaseRaw < 0n) {
-    throw new ClaimMeasurementError(
-      `claim ${tx.signature}: CREATOR balance dropped across the claim ` +
-        `(PUMP Δ${claimedQuoteRaw}, SCRATCHY Δ${claimedBaseRaw}) — concurrent transfer? re-measure`,
-      sigs,
-    )
-  }
-  return { signatures: sigs, claimedQuoteRaw, claimedBaseRaw }
+  return { signatures: sigs, claimedQuoteRaw: deltas.quoteRaw, claimedBaseRaw: deltas.baseRaw }
 }
 
 // ── pool statics (validated once) ────────────────────────────────────────────
@@ -348,8 +296,9 @@ export interface DammV2VenueOptions {
   quoteMint: PublicKey
   /** test seams; production uses the real SDK / RPC */
   cpAmm?: CpAmmLike
-  balanceReader?: TokenBalanceReader
   send?: (tx: Transaction, signers: Signer[]) => Promise<ConfirmedTx>
+  /** getTransaction retries while reading the claim tx's meta */
+  deltaOptions?: TxDeltaOptions
 }
 
 interface VenueStatics extends PoolStatics {
@@ -366,12 +315,10 @@ export class DammV2Venue implements VenueAdapter {
   private readonly baseMint: PublicKey
   private readonly quoteMint: PublicKey
   private readonly cpAmm: CpAmmLike
-  private readonly readBalances: (minContextSlot?: number) => Promise<BaseQuoteBalances>
   private readonly send: (tx: Transaction, signers: Signer[]) => Promise<ConfirmedTx>
+  private readonly deltaOptions: TxDeltaOptions | undefined
   private statics: VenueStatics | null = null
   private initializing: Promise<VenueStatics> | null = null
-  /** landing slot of this venue's last confirmed tx — lower bound for the next pre-claim read */
-  private lastTxSlot: number | undefined
 
   constructor(opts: DammV2VenueOptions) {
     if (opts.baseMint.equals(opts.quoteMint)) throw new Error('DammV2Venue: base and quote mints must differ')
@@ -382,12 +329,7 @@ export class DammV2Venue implements VenueAdapter {
     this.baseMint = opts.baseMint
     this.quoteMint = opts.quoteMint
     this.cpAmm = opts.cpAmm ?? new CpAmm(opts.connection)
-    this.readBalances = makeBaseQuoteReader(
-      opts.balanceReader ?? rpcBalanceReader(opts.connection),
-      opts.creator.publicKey,
-      opts.baseMint,
-      opts.quoteMint,
-    )
+    this.deltaOptions = opts.deltaOptions
     this.send =
       opts.send ??
       ((tx, signers) =>
@@ -524,8 +466,6 @@ export class DammV2Venue implements VenueAdapter {
     const s = await this.init()
     return runMeasuredClaim({
       pending: () => this.pendingFees(),
-      readBalances: (minSlot) => this.readBalances(minSlot),
-      minSlotBefore: this.lastTxSlot,
       sendClaim: async () => {
         const tx = await this.cpAmm.claimPositionFee2({
           owner: this.creator.publicKey,
@@ -541,9 +481,19 @@ export class DammV2Venue implements VenueAdapter {
           receiver: this.creator.publicKey,
           feePayer: this.creator.publicKey,
         })
-        const sent = await this.send(tx, [this.creator])
-        this.lastTxSlot = sent.slot
-        return sent
+        return this.send(tx, [this.creator])
+      },
+      claimDeltas: async (signature) => {
+        const d = await txOwnerTokenDeltas(
+          this.connection,
+          signature,
+          this.creator.publicKey,
+          this.deltaOptions,
+        )
+        return {
+          quoteRaw: d.get(this.quoteMint.toBase58()) ?? 0n,
+          baseRaw: d.get(this.baseMint.toBase58()) ?? 0n,
+        }
       },
     })
   }

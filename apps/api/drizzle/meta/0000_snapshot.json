@@ -1,5 +1,5 @@
 {
-  "id": "1e8d75e2-7d90-4710-ab04-166b12682d56",
+  "id": "5a6ab13a-e859-4967-b775-523df1d6233f",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -90,6 +90,12 @@
         },
         "lock_expires_at": {
           "name": "lock_expires_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_scratch_at": {
+          "name": "last_scratch_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
@@ -331,6 +337,12 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
+        },
+        "absent_since": {
+          "name": "absent_since",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {
@@ -339,6 +351,27 @@
           "columns": [
             {
               "expression": "signature",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "payout_attempts_payout_attempt_uq": {
+          "name": "payout_attempts_payout_attempt_uq",
+          "columns": [
+            {
+              "expression": "payout_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "attempt",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -465,6 +498,13 @@
         },
         "rebuilds": {
           "name": "rebuilds",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "sim_failures": {
+          "name": "sim_failures",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
@@ -1040,6 +1080,30 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::jsonb"
+        },
+        "creator_scratchy_baseline_raw": {
+          "name": "creator_scratchy_baseline_raw",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "swap_sig": {
+          "name": "swap_sig",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "swap_last_valid_block_height": {
+          "name": "swap_last_valid_block_height",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "swap_intent_in_raw": {
+          "name": "swap_intent_in_raw",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
         },
         "error": {
           "name": "error",
