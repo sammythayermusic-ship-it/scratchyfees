@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+
+/*
+ * Palette sampled from the official brand art (assets/brand/), not invented:
+ * mascot body #FC04A8, rays #7E017C / #F919D7, banner purples #A0019F #4E0268,
+ * foil gold #FBD53F → #F9A723 (highlight #FDF771, shade #DF8D21), stage #0E011D / #250144.
+ */
+@theme {
+  --color-stage: #0e011d;
+  --color-stage-2: #250144;
+  --color-stage-3: #3a0b5e;
+  --color-pink: #fc04a8;
+  --color-magenta: #f919d7;
+  --color-ray: #7e017c;
+  --color-electric: #a0019f;
+  --color-plum: #4e0268;
+  --color-gold: #fbd53f;
+  --color-gold-deep: #f9a723;
+  --color-gold-hi: #fdf771;
+  --color-gold-shade: #df8d21;
+  --color-ink: #fff6fd;
+  --color-muted: #cdb6e0;
+
+  --font-display: 'Lilita One', 'Arial Black', system-ui, sans-serif;
+  --font-body: 'Nunito', system-ui, sans-serif;
+}
+
+html,
+body {
+  background: var(--color-stage);
+  color: var(--color-ink);
+}

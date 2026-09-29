@@ -1,0 +1,20 @@
+{
+  "source": "sampled from assets/brand/* by scripts/brand/derive.ts",
+  "mascotBody": "#080808",
+  "mascotRays": "#080808",
+  "bannerStage": "#080818",
+  "bannerWordmark": "#080818",
+  "tokens": {
+    "stage": "#0E011D",
+    "stage2": "#250144",
+    "pink": "#FC04A8",
+    "magenta": "#F919D7",
+    "ray": "#7E017C",
+    "electric": "#A0019F",
+    "plum": "#4E0268",
+    "gold": "#FBD53F",
+    "goldDeep": "#F9A723",
+    "goldHi": "#FDF771",
+    "goldShade": "#DF8D21"
+  }
+}

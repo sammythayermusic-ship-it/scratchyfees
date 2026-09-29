@@ -1,0 +1,27 @@
+{
+  "name": "@scratchy/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure, isomorphic $SCRATCHY economy + provably-fair math (PLAN.md §2, §4). Zero I/O.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./sim": "./src/sim/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "sim": "tsx scripts/sim.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "6.0.3",
+    "vite": "^8.3.1",
+    "vitest": "^5.0.2"
+  }
+}

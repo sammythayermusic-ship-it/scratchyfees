@@ -1,0 +1,26 @@
+# deps / builds
+node_modules/
+.next/
+dist/
+out/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+
+# env + secrets — NEVER commit keys
+.env
+.env.*
+!.env.example
+.devnet/
+*.keypair.json
+id.json
+
+# local data
+.data/
+*.log
+
+# os / editors
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
