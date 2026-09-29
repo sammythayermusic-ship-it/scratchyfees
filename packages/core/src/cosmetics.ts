@@ -17,23 +17,6 @@ export const TIER_SYMBOL: Record<Exclude<TierId, 0>, SymbolKey> = {
   5: 'crown',
 }
 
-/** Cosmetic ticket series inspired by the official banner's tickets. Public (shown before scratching). */
-export const TICKET_SERIES = [
-  { key: 'mega-jackpot', name: 'MEGA JACKPOT' },
-  { key: 'lucky-7s', name: 'LUCKY 7s' },
-  { key: 'gold-rush', name: 'GOLD RUSH' },
-  { key: 'money-bags', name: 'MONEY BAGS' },
-  { key: 'super-7s', name: 'SUPER 7s' },
-  { key: 'diamond-fortune', name: 'DIAMOND FORTUNE' },
-] as const
-
-export type TicketSeriesKey = (typeof TICKET_SERIES)[number]['key']
-
-/** Series depends only on public data (round id + ticket index), so it can never leak an outcome. */
-export function ticketSeries(roundId: number, ticketIdx: number): (typeof TICKET_SERIES)[number] {
-  return TICKET_SERIES[(roundId * 7 + ticketIdx) % TICKET_SERIES.length]!
-}
-
 /**
  * The three symbols under the foil. Winners show a triple of their tier symbol; a jackpot shows
  * three Scratchys; losers show a random non-triple drawn from bytes 16–18 of the (already revealed)

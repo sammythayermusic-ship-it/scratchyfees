@@ -67,7 +67,10 @@ export function totalWeightMicro(entries: readonly { weightMicro: bigint }[]): b
  */
 export function holdingsTier(hUsdMicro: bigint, cfg: EconomyConfig): bigint {
   if (!isEligible(hUsdMicro, cfg)) return 0n
-  const cap = (cfg.multCap * MULT_DIVISOR_USD) / TICKET_BLOCK_USD
+  // the bracket where tickets AND mult have both stopped growing (500 at the §9 defaults)
+  const multSaturation = (cfg.multCap * MULT_DIVISOR_USD) / TICKET_BLOCK_USD
+  const ticketSaturation = (cfg.ticketCap + cfg.ticketsPer50 - 1n) / cfg.ticketsPer50
+  const cap = multSaturation > ticketSaturation ? multSaturation : ticketSaturation
   return minBig(hUsdMicro / (TICKET_BLOCK_USD * MICRO), cap)
 }
 
@@ -82,4 +85,47 @@ export function shouldVoidOnRecheck(
   cfg: EconomyConfig,
 ): boolean {
   return holdingsTier(currentHUsdMicro, cfg) < holdingsTier(snapshotHUsdMicro, cfg)
+}
+
+/**
+ * The reveal-time re-check as the API performs it: raw token balances, both valued at the SNAPSHOT price.
+ * The live price is deliberately not an input — a price move can never void a ticket.
+ */
+export function shouldVoidOnRecheckBalances(
+  snapshotBalanceRaw: bigint,
+  currentBalanceRaw: bigint,
+  decimals: number,
+  snapshotPriceUsdE18: bigint,
+  cfg: EconomyConfig,
+): boolean {
+  return shouldVoidOnRecheck(
+    holdingsUsdMicro(snapshotBalanceRaw, decimals, snapshotPriceUsdE18),
+    holdingsUsdMicro(currentBalanceRaw, decimals, snapshotPriceUsdE18),
+    cfg,
+  )
+}
+
+export interface HoldMoreNudge {
+  /** how many more USD the nudge talks about (MIN_HOLD_USD, i.e. $50) */
+  extraUsd: bigint
+  /** additional tickets per drop from holding extraUsd more */
+  extraTickets: bigint
+  /** multiplier gain (micro-units) from holding extraUsd more (relevant at the ticket cap) */
+  multGainMicro: bigint
+  /** true when neither tickets nor multiplier would grow (above MULT_CAP × $1,000) */
+  maxed: boolean
+}
+
+/**
+ * §6 loss reveal — "shows how many more tickets $50 more of $SCRATCHY would earn". Computed from the
+ * same eligibility functions (no literal 5/50 in UI code). At the 100-ticket cap the gain is in the
+ * multiplier instead; above $25k nothing grows.
+ */
+export function holdMoreNudge(hUsdMicro: bigint, cfg: EconomyConfig): HoldMoreNudge {
+  const extraUsd = cfg.minHoldUsd
+  const now = entryTerms(hUsdMicro, cfg)
+  const next = entryTerms(hUsdMicro + extraUsd * MICRO, cfg)
+  const extraTickets = next.tickets - now.tickets
+  const multGainMicro = now.eligible ? next.multMicro - now.multMicro : 0n
+  return { extraUsd, extraTickets, multGainMicro, maxed: extraTickets === 0n && multGainMicro === 0n }
 }

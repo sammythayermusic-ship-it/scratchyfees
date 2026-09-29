@@ -71,6 +71,9 @@ function parseDecimal(value: string | number, scale: number, exact: boolean): bi
   const intPart = m[2] ?? ''
   const fracPart = m[3] ?? ''
   const exp = m[4] ? Number.parseInt(m[4], 10) : 0
+  if (Math.abs(exp) > 400 || intPart.length + fracPart.length > 400) {
+    throw new RangeError(`decimal out of range: "${s.slice(0, 40)}"`)
+  }
   const digits = BigInt((intPart + fracPart).replace(/^0+(?=\d)/, '') || '0')
   const shift = exp - fracPart.length + scale
   if (shift >= 0) return sign * digits * pow10(shift)

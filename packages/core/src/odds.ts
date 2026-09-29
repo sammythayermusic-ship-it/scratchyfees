@@ -76,3 +76,24 @@ export function expectedValueK10(): { num: bigint; den: bigint } {
   const num = TIERS.reduce((s, t) => s + t.probPpm * t.k10, 0n)
   return { num, den: PPM }
 }
+
+/**
+ * Fast path for simulations: the same exact mapping using plain Numbers.
+ * For integer x < 2^53: x·1e6 < cum·2^53  ⟺  x < ceil(cum·2^53 / 1e6), and every such bound is an
+ * integer ≤ 2^53, so it is exactly representable as a double. Equivalence is unit-tested.
+ */
+export const TIER_THRESHOLDS_53: readonly number[] = CUMULATIVE_PPM.map((c) =>
+  Number((c * TWO_POW_53 + PPM - 1n) / PPM),
+)
+
+export function tierFromUniform53Fast(x: number): TierId {
+  for (let i = 0; i < TIER_THRESHOLDS_53.length; i++) {
+    if (x < TIER_THRESHOLDS_53[i]!) return TIERS[i]!.id
+  }
+  throw new Error('tierFromUniform53Fast: out of range')
+}
+
+export function jackpotThreshold53(odds: bigint): number {
+  // y·odds < 2^53  ⟺  y < ceil(2^53 / odds)
+  return Number((TWO_POW_53 + odds - 1n) / odds)
+}

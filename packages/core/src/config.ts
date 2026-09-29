@@ -101,7 +101,7 @@ const schema = z.object({
     (v) => v >= PAYOUT_RATE_MIN_PPM && v <= PAYOUT_RATE_MAX_PPM,
     'PAYOUT_RATE must be within the 0.3%–0.8% sane range (0.003–0.008)',
   ),
-  ROUND_SECONDS: posInt('ROUND_SECONDS'),
+  ROUND_SECONDS: posInt('ROUND_SECONDS').refine((v) => v <= 86_400n, 'ROUND_SECONDS must be ≤ 86400'),
   MIN_HOLD_USD: posInt('MIN_HOLD_USD'),
   TICKETS_PER_50: posInt('TICKETS_PER_50'),
   TICKET_CAP: posInt('TICKET_CAP'),
@@ -117,7 +117,8 @@ const schema = z.object({
     .string()
     .trim()
     .regex(/^\d+$/, 'MIN_POOL_RESERVE_USD must be whole USD')
-    .transform((v) => BigInt(v)),
+    .transform((v) => BigInt(v))
+    .refine((v) => v > 0n, 'MIN_POOL_RESERVE_USD must be > 0 (zero disables the §2.5 reserve pause)'),
   FEE_SPLIT_POOL: ppm('FEE_SPLIT_POOL').refine((v) => v > 0n && v <= PPM, 'FEE_SPLIT_POOL must be in (0,1]'),
   POOL_TRADING_FEE: ppm('POOL_TRADING_FEE').refine((v) => v >= 0n && v < PPM, 'POOL_TRADING_FEE in [0,1)'),
   MIN_GAS_SOL: z
@@ -130,7 +131,8 @@ const schema = z.object({
         ctx.addIssue({ code: 'custom', message: `MIN_GAS_SOL: ${(e as Error).message}` })
         return z.NEVER
       }
-    }),
+    })
+    .refine((v) => v > 0n, 'MIN_GAS_SOL must be > 0 (a zero/negative minimum disables the §2.5 gas pause)'),
   SWEEP_INTERVAL_MIN: posInt('SWEEP_INTERVAL_MIN'),
   PRICE_CACHE_SECONDS: posInt('PRICE_CACHE_SECONDS'),
 })

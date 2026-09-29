@@ -92,7 +92,8 @@ export function perWeightedTicketEv(
   budget: RoundBudget,
   totalWeightMicro: bigint,
 ): { num: bigint; den: bigint } {
-  return { num: budget.ticketBudgetRaw * 1_000_000n, den: totalWeightMicro === 0n ? 1n : totalWeightMicro }
+  if (totalWeightMicro === 0n) return { num: 0n, den: 1n } // nobody entered: no tickets, no e
+  return { num: budget.ticketBudgetRaw * 1_000_000n, den: totalWeightMicro }
 }
 
 /** §2.4 — "Seed J at launch with 1% of the initial pool." */
