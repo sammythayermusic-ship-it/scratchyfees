@@ -3,7 +3,7 @@ import type { WebSocket } from '@fastify/websocket'
 import { normalizeWalletAddress } from '../chain/address'
 import type { EngineEvent } from '../engine/events'
 import type { Services } from '../services'
-import { isValidSession } from './http'
+import { clientIp, isValidSession } from './http'
 import { roundSnapshot } from './public'
 
 /**
@@ -24,6 +24,8 @@ interface Client {
 
 export async function registerWs(app: FastifyInstance, s: Services, allowedOrigins: string[]) {
   const clients = new Set<Client>()
+  const perIp = new Map<string, number>()
+  const trustCloudflare = s.config.env.TRUST_CLOUDFLARE
   const send = (c: Client, msg: unknown) => {
     if (c.socket.readyState === 1) c.socket.send(JSON.stringify(msg))
   }
@@ -67,9 +69,22 @@ export async function registerWs(app: FastifyInstance, s: Services, allowedOrigi
       socket.close(1008, 'origin not allowed')
       return
     }
+    // per-IP socket cap (security review #6): each connection costs a snapshot + a slot in the fan-out
+    const ip = clientIp(req, trustCloudflare)
+    const open = perIp.get(ip) ?? 0
+    if (open >= 8) {
+      socket.close(1013, 'too many connections')
+      return
+    }
+    perIp.set(ip, open + 1)
     const c: Client = { socket, session: null, wallet: null, msgs: 0, windowStart: Date.now() }
     clients.add(c)
-    socket.on('close', () => clients.delete(c))
+    socket.on('close', () => {
+      clients.delete(c)
+      const n = (perIp.get(ip) ?? 1) - 1
+      if (n <= 0) perIp.delete(ip)
+      else perIp.set(ip, n)
+    })
     socket.on('message', async (buf: Buffer) => {
       const now = Date.now()
       if (now - c.windowStart > 10_000) {

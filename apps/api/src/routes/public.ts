@@ -2,7 +2,7 @@ import { desc, eq, sql } from 'drizzle-orm'
 import type { FastifyInstance } from 'fastify'
 import { entries, jackpot, payouts, rounds, tickets } from '../db/schema'
 import type { Services } from '../services'
-import { fail, jsonSafe } from './http'
+import { clientIp, fail, jsonSafe, KeyedLimiter } from './http'
 
 /**
  * Read-only public endpoints (PLAN §3.2): /api/round, /api/winners, /api/fair/:roundId, /api/stats,
@@ -87,6 +87,35 @@ export async function roundSnapshot(s: Services, wallet?: string | null) {
 
 export async function registerPublicRoutes(app: FastifyInstance, s: Services) {
   const db = s.database.db
+
+  // public reads: per-IP limit + a short cache on the expensive aggregate queries (security review #6)
+  const readLimit = new KeyedLimiter(240)
+  app.addHook('onRequest', async (req, reply) => {
+    if (req.method !== 'GET' || !req.url.startsWith('/api/') || req.url.startsWith('/api/admin')) return
+    if (!readLimit.take(clientIp(req, s.config.env.TRUST_CLOUDFLARE)))
+      return fail(reply, 429, 'rate_limited', 'slow down a little')
+  })
+  const CACHED = /^\/api\/(winners|stats)(\?|$)/
+  const cache = new Map<string, { at: number; payload: string }>()
+  app.addHook('preHandler', async (req, reply) => {
+    if (req.method !== 'GET' || !CACHED.test(req.url)) return
+    const hit = cache.get(req.url)
+    if (hit && Date.now() - hit.at < 3_000)
+      return reply.header('content-type', 'application/json; charset=utf-8').send(hit.payload)
+  })
+  app.addHook('onSend', async (req, reply, payload) => {
+    if (
+      req.method === 'GET' &&
+      CACHED.test(req.url) &&
+      reply.statusCode === 200 &&
+      typeof payload === 'string'
+    ) {
+      if (cache.size > 500) cache.clear()
+      if (!cache.has(req.url) || Date.now() - cache.get(req.url)!.at >= 3_000)
+        cache.set(req.url, { at: Date.now(), payload })
+    }
+    return payload
+  })
 
   app.get('/api/round', async (req) => {
     const q = req.query as { wallet?: string }

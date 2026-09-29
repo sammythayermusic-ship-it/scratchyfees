@@ -17,7 +17,8 @@ export async function buildApp(services: Services): Promise<FastifyInstance> {
   const app = Fastify({
     logger: env.NODE_ENV === 'test' ? false : { level: env.LOG_LEVEL, redact: ['req.headers.authorization'] },
     bodyLimit: 16 * 1024,
-    trustProxy: env.TRUST_CLOUDFLARE,
+    // never trust X-Forwarded-For: the only proxy we honour is Cloudflare's CF-Connecting-IP (see clientIp)
+    trustProxy: false,
   })
 
   await app.register(helmet, { contentSecurityPolicy: false })

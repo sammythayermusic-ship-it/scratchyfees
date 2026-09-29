@@ -7,11 +7,26 @@ const SESSION_RE = /^[A-Za-z0-9_-]{16,64}$/
 
 /** Real client IP: Cloudflare's CF-Connecting-IP only when explicitly trusted (origin firewalled to CF). */
 export function clientIp(req: FastifyRequest, trustCloudflare: boolean): string {
+  let ip = req.socket?.remoteAddress ?? req.ip ?? 'unknown'
   if (trustCloudflare) {
     const cf = req.headers['cf-connecting-ip']
-    if (typeof cf === 'string' && cf.length > 0 && cf.length < 64) return cf
+    if (typeof cf === 'string' && cf.length > 0 && cf.length < 64) ip = cf
   }
-  return req.ip
+  return ipBucket(ip)
+}
+
+/** IPv6 clients get a whole /64 for free, so limits key on the /64 (security review #4); IPv4 as-is. */
+export function ipBucket(ip: string): string {
+  const v = ip.startsWith('::ffff:') ? ip.slice(7) : ip
+  if (!v.includes(':')) return v
+  const [head, tail] = v.split('::') as [string, string | undefined]
+  const left = head ? head.split(':') : []
+  const right = tail ? tail.split(':') : []
+  const full = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right]
+  return `${full
+    .slice(0, 4)
+    .map((g) => (g || '0').toLowerCase().replace(/^0+(?=.)/, ''))
+    .join(':')}::/64`
 }
 
 /** Client-generated session id (random, stored in the browser) — identifies a tab for the scratch lock. */

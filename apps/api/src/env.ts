@@ -164,6 +164,11 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   if (env.NODE_ENV === 'production' && env.CHAIN_MODE !== 'solana') {
     throw new Error('NODE_ENV=production requires CHAIN_MODE=solana (memory mode is for local dev and tests)')
   }
+  if (env.SWAP === 'jupiter' && env.SOLANA_CLUSTER === 'mainnet-beta') {
+    // the CREATOR key would sign a Jupiter-built tx checked only by its JSON metadata (security review #7);
+    // the launch pool collects fees in PUMP only (OnlyB), so no swap is needed — refuse until it's simulated
+    throw new Error('SWAP=jupiter is refused on mainnet (use the OnlyB pool with SWAP=none)')
+  }
   if ((env.DEV_FORCE_JACKPOT || env.DEV_FORCE_BREAKER_ROUND > 0) && env.SOLANA_CLUSTER === 'mainnet-beta') {
     throw new Error('DEV_FORCE_JACKPOT / DEV_FORCE_BREAKER_ROUND are devnet/localnet-only')
   }

@@ -68,6 +68,7 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
   } | null>(null)
   const [scratchAll, setScratchAll] = useState(false)
   const [lossNudge, setLossNudge] = useState(false)
+  const [lockOverride, setLockOverride] = useState(false)
   const lossTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [practiceKey, setPracticeKey] = useState(0)
   const price = live.snapshot?.prices.pumpUsdE18 ?? null
@@ -277,16 +278,22 @@ export function PlayArea({ onWallet }: { onWallet: (w: string | null) => void })
       <EligibilityCard r={result} />
       {notice && <p className="panel px-4 py-2 text-center font-display text-gold">{notice}</p>}
 
-      {result.locked ? (
+      {result.locked && !lockOverride ? (
         <div className="panel p-6 text-center">
           <p className="font-display text-xl">this wallet&apos;s tickets are being scratched</p>
           <p className="mt-1 text-sm text-muted">
             Another tab or device has them right now. They free up here automatically about 45 seconds after
             that one goes quiet.
           </p>
-          <button type="button" className="btn-pink mt-4" onClick={() => void load(wallet)}>
-            try again
-          </button>
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            <button type="button" className="btn-pink" onClick={() => void load(wallet)}>
+              try again
+            </button>
+            {/* the lock is advisory: the real owner can always scratch here (a pasted wallet proves nothing) */}
+            <button type="button" className="btn-ghost" onClick={() => setLockOverride(true)}>
+              it&apos;s me — scratch here
+            </button>
+          </div>
         </div>
       ) : tickets.length === 0 ? (
         <div className="grid items-center gap-5 md:grid-cols-2">

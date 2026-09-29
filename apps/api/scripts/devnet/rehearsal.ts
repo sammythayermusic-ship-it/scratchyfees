@@ -153,6 +153,7 @@ const stats = {
   enters: 0,
   scratchCalls: 0,
   retries: 0,
+  lateScratches: 0,
   ticketsScratched: 0,
   wins: 0,
   jackpots: 0,
@@ -182,6 +183,10 @@ async function play(p: Player): Promise<void> {
     ticket_ids: fresh,
   })
   stats.scratchCalls++
+  if (s.status === 409 && 'error' in s.json && s.json.error === 'not_live') {
+    stats.lateScratches++ // the round ended between the enter and the scratch: correct refusal, not a bug
+    return
+  }
   if (s.status !== 200 || !('ok' in s.json)) {
     stats.errors.push(`${p.label} scratch ${s.status}: ${JSON.stringify(s.json).slice(0, 160)}`)
     return
@@ -283,7 +288,11 @@ async function main() {
     const open = (await s.database.db.select({ status: payouts.status }).from(payouts)).filter((p) =>
       ['queued', 'sending', 'held', 'failed'].includes(p.status),
     ).length
-    if (open === 0 || Date.now() > settleUntil) break
+    const openSweeps = (await s.database.db.select({ status: sweeps.status }).from(sweeps)).filter((x) =>
+      ['claiming', 'claimed', 'split'].includes(x.status),
+    ).length
+    if (openSweeps > 0 && s.sweeper) await s.sweeper.runOnce().catch(() => {}) // finish the last split
+    if ((open === 0 && openSweeps === 0) || Date.now() > settleUntil) break
     await sleep(3_000)
   }
   await app.close()

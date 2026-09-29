@@ -28,3 +28,6 @@ id.json
 # local preview config (holds a throwaway dev admin token)
 .claude/launch.json
 .next-*/
+
+# local exports / archives
+*.tgz
