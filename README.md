@@ -7,14 +7,14 @@ pre-rolled from a committed seed and can be re-derived by anyone on `/fair`. Ful
 
 ## Monorepo
 
-| Path            | What                                                                                                                                                                                      |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/core` | Pure, isomorphic economy + provably-fair math (PLAN §2, §4). Exact integer math, zero I/O.                                                                                                |
-| `apps/api`      | Fastify: round engine, exactly-once payouts, fee sweeper, monitor, reconciler, websocket.                                                                                                 |
-| `apps/web`      | Next.js: the scratch experience, `/winners`, `/fair`, `/faq`, `/admin`.                                                                                                                   |
-| `assets/brand`  | Official brand art (untouched). `pnpm brand` derives the web crops.                                                                                                                       |
-| `docs/`         | [ECONOMY](docs/ECONOMY.md) · [FAIRNESS](docs/FAIRNESS.md) · [SFX](docs/SFX.md) · [RUNBOOK](docs/RUNBOOK.md) · [LAUNCH-CHECKLIST](docs/LAUNCH-CHECKLIST.md) · [SECURITY](docs/SECURITY.md) |
-| `deploy/`       | systemd unit + Cloudflare Tunnel example for the API.                                                                                                                                     |
+| Path            | What                                                                                                                                                                                                                       |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/core` | Pure, isomorphic economy + provably-fair math (PLAN §2, §4). Exact integer math, zero I/O.                                                                                                                                 |
+| `apps/api`      | Fastify: round engine, exactly-once payouts, fee sweeper, monitor, reconciler, websocket.                                                                                                                                  |
+| `apps/web`      | Next.js: the scratch experience, `/winners`, `/fair`, `/faq`, `/admin`.                                                                                                                                                    |
+| `assets/brand`  | Official brand art (untouched). `pnpm brand` derives the web crops.                                                                                                                                                        |
+| `docs/`         | [REHEARSAL](docs/REHEARSAL.md) · [ECONOMY](docs/ECONOMY.md) · [FAIRNESS](docs/FAIRNESS.md) · [SFX](docs/SFX.md) · [RUNBOOK](docs/RUNBOOK.md) · [LAUNCH-CHECKLIST](docs/LAUNCH-CHECKLIST.md) · [SECURITY](docs/SECURITY.md) |
+| `deploy/`       | systemd unit + Cloudflare Tunnel example for the API.                                                                                                                                                                      |
 
 ## Run it locally (no keys, no Docker, no chain)
 
