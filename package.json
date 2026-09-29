@@ -21,7 +21,8 @@
     "sfx": "tsx scripts/sfx/synth.ts",
     "devnet:setup": "pnpm --filter @scratchy/api devnet:setup",
     "devnet:smoke": "pnpm --filter @scratchy/api devnet:smoke",
-    "devnet:fee-inflow": "pnpm --filter @scratchy/api devnet:fee-inflow"
+    "devnet:fee-inflow": "pnpm --filter @scratchy/api devnet:fee-inflow",
+    "devnet:rehearsal": "pnpm --filter @scratchy/api devnet:rehearsal"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",

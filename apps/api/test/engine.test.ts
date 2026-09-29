@@ -190,6 +190,31 @@ describe('round engine', () => {
     )
   })
 
+  it('Decision C: activity that continues past the boundary (re-paste / heartbeat at the drop) never drops the wallet', async () => {
+    await setup()
+    await engine.tick()
+    const w = devAddress('bea')
+    await entriesSvc.enter({ wallet: w, sessionId: 's1', ip: '1.1.1.1' }) // active in round N
+    clock += ROUND - 5_000 + 100 // 100 ms past the boundary, BEFORE the engine ticks
+    await entriesSvc.enter({ wallet: w, sessionId: 's1', ip: '1.1.1.1' }) // the client refreshes at the drop
+    await entriesSvc.heartbeat('s1', w)
+    await engine.tick()
+    const r = await liveRound()
+    const [e] = await database.db
+      .select()
+      .from(entries)
+      .where(and(eq(entries.roundId, r.id), eq(entries.wallet, w)))
+    expect(e).toBeTruthy()
+    // …and a wallet whose FIRST activity is after the boundary waits for the following drop
+    const late = devAddress('cal')
+    await entriesSvc.enter({ wallet: late, sessionId: 's2', ip: '2.2.2.2' })
+    const [none] = await database.db
+      .select()
+      .from(entries)
+      .where(and(eq(entries.roundId, r.id), eq(entries.wallet, late)))
+    expect(none).toBeUndefined()
+  })
+
   it('ending a round reveals a seed that matches its commitment and every ticket re-derives', async () => {
     await setup()
     await engine.tick()

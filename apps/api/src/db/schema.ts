@@ -38,6 +38,20 @@ export const wallets = pgTable('wallets', {
   eligibleSince: ts('eligible_since'),
 })
 
+/**
+ * Decision C, exactly: one row per wallet per round window in which it was active (paste, or a heartbeat from
+ * the session holding it). Round N+1's entrants are the wallets with a row for round N's window. A single
+ * "last active" timestamp is not enough — activity continuing past the boundary would overwrite it.
+ */
+export const activity = pgTable(
+  'activity',
+  {
+    wallet: text('wallet').notNull(),
+    windowStart: ts('window_start').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.wallet, t.windowStart] }), index('activity_window_idx').on(t.windowStart)],
+)
+
 export const rounds = pgTable(
   'rounds',
   {

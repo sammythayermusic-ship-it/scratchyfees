@@ -121,6 +121,10 @@ const schema = z.object({
   DEV_FORCE_JACKPOT: bool(false),
   /** the rehearsal wallet whose ticket 0 is ground into a jackpot hit (devnet only) */
   DEV_FORCE_JACKPOT_WALLET: optStr,
+  /** with DEV_FORCE_JACKPOT: grind only this round id's seed (0 = every round) — devnet only */
+  DEV_FORCE_JACKPOT_ROUND: int(0, 0),
+  /** rehearsal: this round id runs with a 1-ppm breaker so any win trips it (Decision E drill) — devnet only */
+  DEV_FORCE_BREAKER_ROUND: int(0, 0),
 })
 
 export type RuntimeEnv = z.infer<typeof schema>
@@ -160,8 +164,8 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   if (env.NODE_ENV === 'production' && env.CHAIN_MODE !== 'solana') {
     throw new Error('NODE_ENV=production requires CHAIN_MODE=solana (memory mode is for local dev and tests)')
   }
-  if (env.DEV_FORCE_JACKPOT && env.SOLANA_CLUSTER === 'mainnet-beta') {
-    throw new Error('DEV_FORCE_JACKPOT is devnet/localnet-only')
+  if ((env.DEV_FORCE_JACKPOT || env.DEV_FORCE_BREAKER_ROUND > 0) && env.SOLANA_CLUSTER === 'mainnet-beta') {
+    throw new Error('DEV_FORCE_JACKPOT / DEV_FORCE_BREAKER_ROUND are devnet/localnet-only')
   }
   if (env.NODE_ENV === 'production' && (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32)) {
     throw new Error('ADMIN_TOKEN must be set (≥ 32 chars) in production')

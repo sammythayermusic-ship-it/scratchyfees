@@ -18,14 +18,24 @@ import {
   type EconomyConfig,
   type RoundParams,
 } from '@scratchy/core'
-import { and, asc, desc, eq, gte, isNotNull, isNull, lte } from 'drizzle-orm'
+import { and, asc, desc, eq, isNotNull, isNull, lt, lte } from 'drizzle-orm'
 import type pg from 'pg'
 import type { Alerter } from '../alerts/types'
 import type { ChainClient } from '../chain/types'
 import type { Db } from '../db/client'
 import { LOCK_KEYS, tryAdvisoryLock, type ReleaseLock } from '../db/lock'
 import { reservedRaw } from '../db/queries'
-import { config, entries, jackpot, payouts, rounds, roundSecrets, tickets, wallets } from '../db/schema'
+import {
+  activity,
+  config,
+  entries,
+  jackpot,
+  payouts,
+  rounds,
+  roundSecrets,
+  tickets,
+  wallets,
+} from '../db/schema'
 import type { PriceOracle } from '../oracle/types'
 import type { EventBus } from './events'
 import type { PauseRegistry } from './pauses'
@@ -66,6 +76,10 @@ export interface RoundEngineDeps {
   /** devnet/localnet rehearsal only: grind the NEXT round's seed (before its commitment) so this wallet's
    *  ticket 0 hits the jackpot — the commitment is published normally, so /fair still verifies */
   devForceJackpotWallet?: string | null
+  /** with devForceJackpotWallet: only this round id (null = every round) */
+  devForceJackpotRound?: number | null
+  /** devnet/localnet rehearsal only: this round id runs with a 1-ppm breaker so any ticket win trips it */
+  devForceBreakerRound?: number | null
   now?: () => Date
 }
 
@@ -246,7 +260,9 @@ export class RoundEngine {
         const [existing] = await tx.select().from(rounds).where(eq(rounds.startsAt, startsAt))
         return existing!
       }
-      if (forced) seed = grindJackpotSeed(forced, row!.id, this.d.economy.jackpotOdds)
+      if (forced && (!this.d.devForceJackpotRound || this.d.devForceJackpotRound === row!.id)) {
+        seed = grindJackpotSeed(forced, row!.id, this.d.economy.jackpotOdds)
+      }
       const [u] = await tx
         .update(rounds)
         .set({ serverSeedHash: seedCommitment(seed) })
@@ -273,7 +289,8 @@ export class RoundEngine {
     // instance already started this boundary and queued the next — nothing to do
     if (pending.startsAt.getTime() > T.getTime()) return
     const endsAt = new Date(T.getTime() + this.roundMs)
-    const cfg = await this.effectiveEconomy()
+    let cfg = await this.effectiveEconomy()
+    if (this.d.devForceBreakerRound === pending.id) cfg = { ...cfg, roundBreakerPpm: 1n } // rehearsal drill
 
     // ── snapshot (outside the transaction: no locks across RPC) ──
     const bal = await this.d.chain.getAtaBalance(this.d.prizeAddress, this.d.pumpMint, 'finalized')
@@ -348,13 +365,15 @@ export class RoundEngine {
 
     // entrants: active during the previous round window (Decision C)
     const windowStart = new Date(T.getTime() - this.roundMs)
-    const conds = [gte(wallets.lastActiveAt, windowStart), lte(wallets.lastActiveAt, T)]
-    if (this.d.requireHoldOneRound) conds.push(lte(wallets.eligibleSince, windowStart))
+    const active = eq(activity.windowStart, windowStart)
     const candidates = (
-      await this.d.db
-        .select({ address: wallets.address })
-        .from(wallets)
-        .where(and(...conds))
+      this.d.requireHoldOneRound
+        ? await this.d.db
+            .select({ address: activity.wallet })
+            .from(activity)
+            .innerJoin(wallets, eq(wallets.address, activity.wallet))
+            .where(and(active, lte(wallets.eligibleSince, windowStart)))
+        : await this.d.db.select({ address: activity.wallet }).from(activity).where(active)
     )
       .map((w) => w.address)
       .filter((a) => !this.d.excludedWallets.has(a))
@@ -435,6 +454,7 @@ export class RoundEngine {
       return next
     })
     if (Jafter === null) return
+    await this.d.db.delete(activity).where(lt(activity.windowStart, new Date(T.getTime() - 86_400_000)))
     await this.createPending(endsAt)
     this.emitDrop(
       pending.id,

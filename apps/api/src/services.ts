@@ -12,7 +12,7 @@ import type { ChainClient } from './chain/types'
 import { createDatabase, runMigrations, type Database } from './db/client'
 import { LOCK_KEYS, tryAdvisoryLock } from './db/lock'
 import { config as configTable } from './db/schema'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import { isValidPublicKey } from './chain/address'
 import { reservedRaw } from './db/queries'
 import { EntryService } from './engine/entries'
@@ -73,6 +73,8 @@ export interface Services {
   onPayout(listener: (e: PayoutEvent) => void): () => void
   /** record the payout mint's current extensions/hook as reviewed (admin resume of a mint_changed pause) */
   acknowledgeMint(): Promise<void>
+  /** the accepted (acknowledged) payout-mint fingerprint vs the current one — for reviewing a mint_changed pause */
+  mintState(): Promise<{ accepted: string | null; current: string | null; error?: string }>
   start(): void
   stop(): Promise<void>
 }
@@ -108,6 +110,18 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
   const database = opts.database ?? createDatabase(env.DATABASE_URL)
   if (opts.migrate !== false) await runMigrations(database.db)
   const db = database.db
+  // The in-memory chain starts fresh on every boot, so rows describing a previous boot's chain (ledger, payouts,
+  // rounds) would contradict it — the reconciler would rightly see "missing" PRIZE funds and hard-stop payouts.
+  // Memory mode is dev/tests only (production requires CHAIN_MODE=solana), so start from a clean database.
+  // Tests pass their own freshly truncated database.
+  if (env.CHAIN_MODE === 'memory' && !opts.database && env.NODE_ENV !== 'production') {
+    await db.execute(sql`
+      DO $$ DECLARE r record; BEGIN
+        FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename NOT LIKE '__drizzle%' LOOP
+          EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' RESTART IDENTITY CASCADE';
+        END LOOP;
+      END $$;`)
+  }
   const alerter = createAlerter(env, new DbEventsSink(db))
   const pauses = new PauseRegistry(db, alerter)
   await pauses.load()
@@ -353,6 +367,8 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       env.DEV_FORCE_JACKPOT && env.SOLANA_CLUSTER !== 'mainnet-beta'
         ? (env.DEV_FORCE_JACKPOT_WALLET ?? null)
         : null,
+    devForceJackpotRound: env.DEV_FORCE_JACKPOT_ROUND || null,
+    devForceBreakerRound: env.SOLANA_CLUSTER !== 'mainnet-beta' ? env.DEV_FORCE_BREAKER_ROUND || null : null,
     now: opts.now,
   })
   const scratch = new ScratchService({
@@ -398,6 +414,14 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       block: m.blockingExtensions,
     })
   }
+  const mintState = async () => {
+    const [ack] = await db.select().from(configTable).where(eq(configTable.key, 'mint.ack'))
+    try {
+      return { accepted: ack?.value ?? null, current: await mintFingerprint() }
+    } catch (e) {
+      return { accepted: ack?.value ?? null, current: null, error: (e as Error).message }
+    }
+  }
   const acknowledgeMint = async () => {
     const fp = await mintFingerprint()
     await db
@@ -430,6 +454,7 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
 
   return {
     acknowledgeMint,
+    mintState,
     config,
     database,
     chain,

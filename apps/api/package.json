@@ -14,7 +14,9 @@
     "db:migrate": "tsx scripts/db-migrate.ts",
     "devnet:setup": "tsx scripts/devnet/setup.ts",
     "devnet:smoke": "tsx scripts/devnet/smoke.ts",
-    "devnet:fee-inflow": "tsx scripts/devnet/fee-inflow.ts"
+    "devnet:fee-inflow": "tsx scripts/devnet/fee-inflow.ts",
+    "devnet:rehearsal": "tsx scripts/devnet/rehearsal.ts",
+    "loadtest": "tsx scripts/loadtest.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
@@ -35,9 +37,11 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@types/autocannon": "^7.12.7",
     "@types/bn.js": "^5.2.0",
     "@types/node": "^22.20.4",
     "@types/pg": "^8.23.1",
+    "autocannon": "^8.0.0",
     "drizzle-kit": "^0.31.11",
     "embedded-postgres": "18.4.0-beta.17",
     "typescript": "6.0.3",

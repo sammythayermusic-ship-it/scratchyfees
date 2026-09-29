@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { eq } from 'drizzle-orm'
 import { buildApp } from '../src/app'
+import { activity, jackpot, payouts } from '../src/db/schema'
 import type { Database } from '../src/db/client'
 import { loadConfig } from '../src/env'
 import { buildServices, devAddress, type Services } from '../src/services'
@@ -50,6 +52,22 @@ const post = (url: string, body: unknown, session = S1) =>
   app!.inject({ method: 'POST', url, payload: body as object, headers: { 'x-scratchy-session': session } })
 
 describe('HTTP API', () => {
+  it('RPC trouble on /api/enter → clean 503 (no provider details), and the wallet is still entered for the next drop', async () => {
+    const { s } = await boot()
+    const w = devAddress('rpc-down')
+    s.memory!.chain.faults.rpcDown = true
+    const res = await post('/api/enter', { wallet: w })
+    expect(res.statusCode).toBe(503)
+    expect(res.json()).toEqual({
+      error: 'chain_busy',
+      message: 'The Solana network is busy — try again in a few seconds.',
+    })
+    expect(res.headers['retry-after']).toBe('3')
+    const rows = await database!.db.select().from(activity).where(eq(activity.wallet, w))
+    expect(rows).toHaveLength(1)
+    s.memory!.chain.faults.rpcDown = false
+  })
+
   it('enter → drop → scratch → payout → winners → fair, end to end', async () => {
     const { s } = await boot()
     await s.engine.tick()
@@ -131,13 +149,24 @@ describe('HTTP API', () => {
     expect(st.json().payoutRate.effective).toBe('0.005')
     await app!.inject({ method: 'POST', url: '/api/admin/pause', headers: auth, payload: { note: 'test' } })
     expect((await app!.inject({ method: 'GET', url: '/health' })).json().paused).toBe('manual')
-    await app!.inject({
+    const noNote = await app!.inject({
       method: 'POST',
       url: '/api/admin/resume',
       headers: auth,
       payload: { reason: 'manual' },
     })
+    expect(noNote.statusCode).toBe(400) // every admin action needs a note (audit trail)
+    await app!.inject({
+      method: 'POST',
+      url: '/api/admin/resume',
+      headers: auth,
+      payload: { reason: 'manual', note: 'drill over' },
+    })
     expect((await app!.inject({ method: 'GET', url: '/health' })).json().paused).toBeNull()
+    const st2 = (await app!.inject({ method: 'GET', url: '/api/admin/status', headers: auth })).json()
+    expect(st2.events.some((e: { kind: string }) => e.kind === 'resume.manual')).toBe(true)
+    expect(st2.thresholds.minGasSol).toBeTruthy()
+    expect(st2.mint.accepted === null || typeof st2.mint.accepted === 'string').toBe(true)
     expect(
       (
         await app!.inject({
@@ -155,6 +184,48 @@ describe('HTTP API', () => {
       payload: { rate: '0.006' },
     })
     expect(ok.json()).toMatchObject({ ok: true, payoutRate: '0.006' })
+  })
+
+  it('admin retry of a permanently failed JACKPOT takes the amount back out of the pot (never owed twice)', async () => {
+    await boot()
+    const auth = { authorization: `Bearer ${ADMIN}` }
+    const db = database!.db
+    await db.insert(jackpot).values({ id: 1, amountRaw: 1_000n, seeded: true }) // includes a returned 400
+    const [a] = await db
+      .insert(payouts)
+      .values({
+        kind: 'jackpot',
+        wallet: devAddress('jp-a'),
+        amountRaw: 400n,
+        roundId: 1,
+        status: 'failed_permanent',
+      })
+      .returning()
+    const [b] = await db
+      .insert(payouts)
+      .values({
+        kind: 'jackpot',
+        wallet: devAddress('jp-b'),
+        amountRaw: 700n,
+        roundId: 2,
+        status: 'failed_permanent',
+      })
+      .returning()
+    const retry = (id: bigint, note?: string) =>
+      app!.inject({
+        method: 'POST',
+        url: `/api/admin/payouts/${id}/retry`,
+        headers: auth,
+        payload: note ? { note } : {},
+      })
+    expect((await retry(a!.id)).statusCode).toBe(400) // note required
+    const ok = await retry(a!.id, 'account unfrozen')
+    expect(ok.statusCode).toBe(200)
+    expect((await db.select().from(jackpot))[0]!.amountRaw).toBe(600n)
+    const short = await retry(b!.id, 'try again')
+    expect(short.statusCode).toBe(409)
+    expect(short.json().error).toBe('pot_short')
+    expect((await db.select().from(payouts).where(eq(payouts.id, b!.id)))[0]!.status).toBe('failed_permanent')
   })
 
   it('rate limits /api/enter per IP', async () => {

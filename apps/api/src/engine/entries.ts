@@ -3,7 +3,7 @@ import { and, asc, eq, sql } from 'drizzle-orm'
 import { normalizeWalletAddress } from '../chain/address'
 import type { ChainClient } from '../chain/types'
 import type { Db } from '../db/client'
-import { entries, rounds, tickets, wallets } from '../db/schema'
+import { activity, entries, rounds, tickets, wallets } from '../db/schema'
 import type { PriceOracle } from '../oracle/types'
 import type { TicketOutcome } from './scratch'
 
@@ -75,6 +75,7 @@ export class EntryService {
   private readonly ipWallets = new Map<string, Set<string>>()
   private ipWindow = 0
   private readonly lastActivityWrite = new Map<string, number>()
+  private readonly activeWindow = new Map<string, number>()
   /** wallet → session that most recently pasted it (heartbeats from that session renew activity) */
   private readonly owners = new Map<string, string>()
   private decimals: number | null = null
@@ -125,6 +126,9 @@ export class EntryService {
     seen.add(wallet)
     this.ipWallets.set(input.ip, seen)
     this.owners.set(wallet, input.sessionId)
+    // Decision C activity first: an RPC hiccup below must never cost a player the next drop (eligibility is
+    // decided from the snapshot at the drop anyway, not from this preview)
+    await this.markActive(wallet, now)
 
     await this.d.beforeEnter?.(wallet)
     const xHandle = EntryService.normalizeHandle(input.xHandle)
@@ -204,6 +208,19 @@ export class EntryService {
     }
   }
 
+  /** Decision C: record that `wallet` was active in the current round window (once per window per process). */
+  private async markActive(wallet: string, now: Date): Promise<void> {
+    const roundMs = this.d.economy.roundSeconds * 1000
+    const windowStart = Math.floor(now.getTime() / roundMs) * roundMs
+    if (this.activeWindow.get(wallet) === windowStart) return
+    await this.d.db
+      .insert(activity)
+      .values({ wallet, windowStart: new Date(windowStart) })
+      .onConflictDoNothing()
+    if (this.activeWindow.size > 100_000) this.activeWindow.clear()
+    this.activeWindow.set(wallet, windowStart)
+  }
+
   /**
    * Visible-tab heartbeat. From the session that pasted the wallet it keeps the wallet ACTIVE (entered in the
    * next drop) and renews the scratch lock it holds. Writes are throttled.
@@ -212,6 +229,7 @@ export class EntryService {
     const wallet = normalizeWalletAddress(walletInput)
     if (!wallet || this.owners.get(wallet) !== sessionId) return
     const now = this.now()
+    await this.markActive(wallet, now)
     const last = this.lastActivityWrite.get(wallet) ?? 0
     if (now.getTime() - last >= ACTIVITY_WRITE_THROTTLE_MS) {
       this.lastActivityWrite.set(wallet, now.getTime())

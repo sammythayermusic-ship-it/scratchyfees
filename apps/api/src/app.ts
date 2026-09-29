@@ -3,6 +3,7 @@ import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
 import websocket from '@fastify/websocket'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { TransientChainError } from './chain/types'
 import { registerAdminRoutes } from './routes/admin'
 import { clientIp } from './routes/http'
 import { registerPlayRoutes } from './routes/play'
@@ -30,6 +31,24 @@ export async function buildApp(services: Services): Promise<FastifyInstance> {
     keyGenerator: (req) => clientIp(req, env.TRUST_CLOUDFLARE),
   })
   await app.register(websocket, { options: { maxPayload: 4_096 } })
+
+  // never leak internals (RPC URLs/keys in provider errors, stack traces); RPC trouble is a retryable 503
+  app.setErrorHandler((err: Error & { statusCode?: number; code?: string }, req, reply) => {
+    if (err instanceof TransientChainError) {
+      req.log.warn({ err: err.message }, 'transient chain error')
+      return reply
+        .status(503)
+        .header('retry-after', '3')
+        .send({ error: 'chain_busy', message: 'The Solana network is busy — try again in a few seconds.' })
+    }
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      return reply.status(err.statusCode).send({ error: err.code ?? 'bad_request', message: err.message })
+    }
+    req.log.error(err)
+    return reply
+      .status(500)
+      .send({ error: 'internal', message: 'Something went wrong on our side — try again.' })
+  })
 
   app.get('/health', async () => ({
     ok: true,

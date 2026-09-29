@@ -6,7 +6,7 @@ import {
 } from '@scratchy/core'
 import { desc, eq, inArray, like, or, sql } from 'drizzle-orm'
 import type { FastifyInstance } from 'fastify'
-import { config, events, payouts, rounds, sweeps, wallets } from '../db/schema'
+import { config, events, jackpot, payoutAttempts, payouts, rounds, sweeps, wallets } from '../db/schema'
 import { HARD_PAUSE_REASONS, type HardPauseReason } from '../engine/pauses'
 import type { Services } from '../services'
 import { adminAuthorized, fail, jsonSafe } from './http'
@@ -38,12 +38,20 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
       .from(events)
       .where(
         or(
-          like(events.kind, 'breaker.%'),
-          like(events.kind, 'pause.%'),
-          like(events.kind, 'resume.%'),
-          like(events.kind, 'invariant.%'),
-          like(events.kind, 'sweep.%'),
-          like(events.kind, 'payout.fail%'),
+          ...[
+            'breaker.%',
+            'pause.%',
+            'resume.%',
+            'invariant.%',
+            'sweep.%',
+            'payout.%',
+            'monitor.%',
+            'config.%',
+            'mint.%',
+            'engine.%',
+            'admin.%',
+            'round.skipped%',
+          ].map((k) => like(events.kind, k)),
         ),
       )
       .orderBy(desc(events.id))
@@ -55,7 +63,53 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
         SELECT COUNT(*) FILTER (WHERE status = 'queued')::int AS queued, COUNT(*) FILTER (WHERE status = 'sending')::int AS sending
         FROM payouts`)
     ).rows
+    const statusCounts = Object.fromEntries(
+      (
+        await db.execute<{ status: string; n: number }>(
+          sql`SELECT status, COUNT(*)::int AS n FROM payouts GROUP BY status`,
+        )
+      ).rows.map((r) => [r.status, r.n]),
+    )
+    // latest attempt per problem payout (signature → Solscan, status, error)
+    const attempts = problem.length
+      ? await db
+          .select()
+          .from(payoutAttempts)
+          .where(
+            inArray(
+              payoutAttempts.payoutId,
+              problem.map((p) => p.id),
+            ),
+          )
+          .orderBy(desc(payoutAttempts.attempt))
+      : []
+    const attemptInfo = new Map<
+      string,
+      { attempts: number; lastSignature: string; lastStatus: string; lastError: string | null }
+    >()
+    for (const a of attempts) {
+      const k = String(a.payoutId)
+      const cur = attemptInfo.get(k)
+      if (cur) cur.attempts++
+      else
+        attemptInfo.set(k, {
+          attempts: 1,
+          lastSignature: a.signature,
+          lastStatus: a.status,
+          lastError: a.error,
+        })
+    }
+    const env = s.config.env
     return jsonSafe({
+      serverTime: new Date().toISOString(),
+      statusCounts,
+      thresholds: {
+        minGasSol: scaledToDecimal(s.config.economy.minGasLamports, 9),
+        minPoolReserveUsd: s.config.economy.minPoolReserveUsd,
+        reserveHysteresis: env.RESERVE_HYSTERESIS,
+        minCreatorGasSol: env.MIN_CREATOR_GAS_SOL,
+      },
+      mint: await s.mintState(),
       pauses: s.pauses.list(),
       monitor: s.monitor.state(),
       oracle: s.oracle.peek(),
@@ -67,7 +121,7 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
         appliesFrom: 'next round',
       },
       queue,
-      problemPayouts: problem,
+      problemPayouts: problem.map((p) => ({ ...p, attempt: attemptInfo.get(String(p.id)) ?? null })),
       events: recentEvents,
       sweeps: recentSweeps,
       rounds: recentRounds.map((r) => ({
@@ -79,8 +133,17 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
     })
   })
 
-  app.post('/api/admin/pause', async (req) => {
-    const note = String((req.body as { note?: unknown })?.note ?? 'paused from admin panel').slice(0, 300)
+  /** every mutating admin action carries a human note and is recorded (events table + Telegram) */
+  const noteOf = (body: unknown): string | null => {
+    const n = String((body as { note?: unknown } | null)?.note ?? '').trim()
+    return n ? n.slice(0, 300) : null
+  }
+  const audit = (kind: string, message: string, data?: Record<string, unknown>) =>
+    s.alerter.notify({ kind: `admin.${kind}`, severity: 'warn', message, immediate: true, data })
+
+  app.post('/api/admin/pause', async (req, reply) => {
+    const note = noteOf(req.body)
+    if (!note) return fail(reply, 400, 'note_required', 'say why you are pausing (note)')
     await s.pauses.set('manual', note)
     return { ok: true, pauses: s.pauses.list() }
   })
@@ -90,9 +153,11 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
     const reason = String(body.reason ?? 'manual') as HardPauseReason
     if (!HARD_PAUSE_REASONS.includes(reason))
       return fail(reply, 400, 'bad_request', `reason must be one of ${HARD_PAUSE_REASONS.join(', ')}`)
+    const note = noteOf(body)
+    if (!note) return fail(reply, 400, 'note_required', 'say what you checked before resuming (note)')
     // resuming a mint_changed pause is the operator's review: the current mint state becomes the accepted one
     if (reason === 'mint_changed') await s.acknowledgeMint()
-    await s.pauses.clear(reason, String(body.note ?? 'resumed from admin panel').slice(0, 300))
+    await s.pauses.clear(reason, note)
     s.worker.wake()
     return { ok: true, pauses: s.pauses.list() }
   })
@@ -125,19 +190,60 @@ export async function registerAdminRoutes(app: FastifyInstance, s: Services) {
   app.post('/api/admin/payouts/:id/retry', async (req, reply) => {
     const raw = (req.params as { id: string }).id
     if (!/^\d+$/.test(raw)) return fail(reply, 400, 'bad_request', 'invalid id')
-    const [p] = await db
-      .update(payouts)
-      .set({ status: 'queued', nextAttemptAt: null, error: null })
-      .where(sql`${payouts.id} = ${BigInt(raw)} AND ${payouts.status} IN ('failed', 'failed_permanent')`)
-      .returning()
-    if (!p) return fail(reply, 409, 'not_retryable', 'only failed / failed_permanent payouts can be retried')
+    const note = noteOf(req.body)
+    if (!note) return fail(reply, 400, 'note_required', 'say why this retry should succeed now (note)')
+    const id = BigInt(raw)
+    const res = await db.transaction(async (tx) => {
+      const [p] = await tx.select().from(payouts).where(eq(payouts.id, id)).for('update')
+      if (!p || (p.status !== 'failed' && p.status !== 'failed_permanent'))
+        return { error: 'not_retryable' as const }
+      if (p.status === 'failed_permanent' && p.kind === 'jackpot') {
+        // Decision B: a permanently failed jackpot went BACK into the pot — take it out again before re-paying,
+        // or the same PUMP would be both owed to this winner and offered to the next one
+        const [pot] = await tx.select().from(jackpot).where(eq(jackpot.id, 1)).for('update')
+        if (!pot || pot.amountRaw < p.amountRaw) return { error: 'pot_short' as const }
+        await tx
+          .update(jackpot)
+          .set({ amountRaw: pot.amountRaw - p.amountRaw, updatedAt: new Date() })
+          .where(eq(jackpot.id, 1))
+      }
+      const [u] = await tx
+        .update(payouts)
+        .set({ status: 'queued', nextAttemptAt: null, error: null, simFailures: 0 })
+        .where(eq(payouts.id, id))
+        .returning()
+      return { payout: u! }
+    })
+    if ('error' in res) {
+      return res.error === 'pot_short'
+        ? fail(
+            reply,
+            409,
+            'pot_short',
+            'the jackpot pot no longer holds this amount (it was paid out since) — resolve manually',
+          )
+        : fail(reply, 409, 'not_retryable', 'only failed / failed_permanent payouts can be retried')
+    }
+    audit(
+      'retry',
+      `payout #${id} (${res.payout.kind}, ${res.payout.amountRaw} raw → ${res.payout.wallet}) re-queued: ${note}`,
+      {
+        payoutId: id.toString(),
+      },
+    )
     s.worker.wake()
-    return jsonSafe({ ok: true, payout: p })
+    return jsonSafe({ ok: true, payout: res.payout })
   })
 
-  app.post('/api/admin/wallets/:address/clear-handle', async (req) => {
+  app.post('/api/admin/wallets/:address/clear-handle', async (req, reply) => {
     const address = (req.params as { address: string }).address
-    await db.update(wallets).set({ xHandle: null }).where(eq(wallets.address, address))
+    const [w] = await db
+      .update(wallets)
+      .set({ xHandle: null })
+      .where(eq(wallets.address, address))
+      .returning()
+    if (!w) return fail(reply, 404, 'not_found', 'no such wallet')
+    audit('clear_handle', `X handle cleared for ${address}${noteOf(req.body) ? `: ${noteOf(req.body)}` : ''}`)
     return { ok: true }
   })
 }
