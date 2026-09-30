@@ -81,7 +81,8 @@ const schema = z.object({
   PRIORITY_FEE_MICROLAMPORTS: int(20_000),
   PRIORITY_FEE_MAX_MICROLAMPORTS: int(500_000),
   PAYOUT_CONCURRENCY: int(4, 1),
-  ATA_RECREATE_LIMIT: int(0),
+  /** max times PRIZE pays to open a wallet's PUMP account (0 = unlimited); stops rent farming */
+  ATA_RECREATE_LIMIT: int(2),
   HOLDINGS_CACHE_SECONDS: int(10),
   /** CREATOR (fee-claim wallet) SOL floor — alert only */
   MIN_CREATOR_GAS_SOL: str('0.05'),

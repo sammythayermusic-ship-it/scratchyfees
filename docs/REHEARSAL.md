@@ -26,3 +26,10 @@ The two red lines in the raw report were harness timing, now fixed in the script
 round ended (the API correctly refused it with `not_live`), and the run stopped while the last sweep was
 splitting (the sweeper resumes open splits on boot). Raw report: `.devnet/rehearsal-report.json`.
 The public devnet RPC rate-limits hard (the p95 latency is mostly 429 back-off); use Helius on mainnet.
+
+## Confirmation run (after the harness fixes)
+
+`pnpm devnet:rehearsal --rounds 12 --round-seconds 30 --jackpot-at 5 --breaker-at 9 --inflow-every 3`:
+**17/17 checks passed** — 37 payouts verified on-chain (one landing each), ledger == chain exactly, 1,690
+tickets re-derived, forced jackpot (round 5) paid, breaker drill (round 9) released and paid, 5/5 sweeps split
+exactly 70/30, every bot call succeeded.

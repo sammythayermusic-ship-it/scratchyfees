@@ -40,9 +40,9 @@ Players never sign anything and never connect a wallet; prizes go only to the ad
 - The PRIZE wallet is hot: the whole pool is on the server. Protect the VPS (tunnel, no inbound ports, SSH keys
   only, updates) and watch Telegram.
 - Jackpot rolls are per ticket, so splitting a > $1k bag across wallets buys more jackpot rolls (ECONOMY flags).
-- `ATA_RECREATE_LIMIT=0` (Decision D) lets a player who closes their PUMP account after every win make PRIZE pay
-  ~0.002 SOL rent each time (the rent goes back to them on close). `ATA_RECREATE_LIMIT=2` stops the farming and
-  never affects winners who keep their account — recommended; the default stays 0 per Decision D.
+- ATA rent farming (close your PUMP account after every win so PRIZE re-pays ~0.002 SOL rent) is capped by
+  `ATA_RECREATE_LIMIT=2` (default): after two openings, that wallet's wins wait until it reopens its own account.
+  Repeat winners who keep their account are never affected.
 - Anyone can reveal anyone's tickets if they know the ids (the advisory lock) — it spoils the theatre, never the
   money.
 - `/api/enter` needs an RPC read per paste; Cloudflare rate-limit rules are the second layer.
