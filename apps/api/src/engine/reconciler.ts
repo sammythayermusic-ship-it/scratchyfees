@@ -3,7 +3,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm'
 import type { Alerter } from '../alerts/types'
 import type { ChainClient } from '../chain/types'
 import type { Db } from '../db/client'
-import { payouts, prizeLedger } from '../db/schema'
+import { payouts, prizeLedger, sweeps } from '../db/schema'
 import type { PauseRegistry } from './pauses'
 
 /**
@@ -13,7 +13,9 @@ import type { PauseRegistry } from './pauses'
  *                    `external_in` and it simply joins the next pool snapshot. Never pauses.
  *   chain < ledger → an unexplained OUTFLOW (possible key compromise): hard stop `invariant` after two
  *                    consecutive observations, unless the gap is covered by transfers still in flight.
- * Runs quietly while any PRIZE-side transfer is in flight (their landing is recorded by the payout worker).
+ * Runs quietly while any PRIZE-side transfer is in flight (their landing is recorded by the payout worker),
+ * and while a direct-distribution fee claim is in flight (a 'claiming' sweep: the venue pays PRIZE straight
+ * from the claim tx and the direct sweeper books that inflow itself as `sweep_in` the moment it is measured).
  */
 
 export interface ReconcileResult {
@@ -97,6 +99,11 @@ export class Reconciler {
       .where(and(eq(payouts.status, 'sending'), inArray(payouts.kind, ['tier', 'jackpot', 'sweep_prize'])))
     const inFlightOut = inFlight.filter((p) => p.signer === 'prize').reduce((s, p) => s + p.amountRaw, 0n)
     const inFlightIn = inFlight.filter((p) => p.kind === 'sweep_prize').reduce((s, p) => s + p.amountRaw, 0n)
+    const claiming = await db
+      .select({ id: sweeps.id })
+      .from(sweeps)
+      .where(eq(sweeps.status, 'claiming'))
+      .limit(1)
     const rec = reconcileBalances(bal.value, ledgerRaw)
     const base = { chainRaw: bal.value, ledgerRaw, slot: bal.slot }
 
@@ -106,7 +113,9 @@ export class Reconciler {
     }
     if (rec.status === 'inflow') {
       this.suspicions = 0
-      if (inFlight.length > 0) return { status: 'waiting', deltaRaw: rec.deltaRaw, ...base } // may be a landed transfer not yet recorded
+      // may be a landed transfer / direct fee claim not yet recorded — the worker / direct sweeper books it
+      if (inFlight.length > 0 || claiming.length > 0)
+        return { status: 'waiting', deltaRaw: rec.deltaRaw, ...base }
       await db
         .insert(prizeLedger)
         .values({

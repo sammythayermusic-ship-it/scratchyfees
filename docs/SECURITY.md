@@ -2,12 +2,12 @@
 
 ## What the server holds
 
-| Secret               | Where                                                    | Blast radius if stolen                                                              |
-| -------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `PRIZE_WALLET_KEY`   | `/etc/scratchy/api.env` (0600)                           | the whole prize pool (it _is_ a hot wallet) + its SOL                               |
-| `CREATOR_WALLET_KEY` | same                                                     | unclaimed/unsplit fees + CREATOR SOL; can move the LP position NFT                  |
-| `ADMIN_TOKEN`        | same (≥ 32 chars, enforced in production and on mainnet) | pause/resume, PAYOUT_RATE within 0.3–0.8%, retries — **never** moves funds directly |
-| OPS                  | **address only**                                         | nothing on the server                                                               |
+| Secret               | Where                                                                           | Blast radius if stolen                                                              |
+| -------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `PRIZE_WALLET_KEY`   | `/etc/scratchy/api.env` (0600)                                                  | the whole prize pool (it _is_ a hot wallet) + its SOL                               |
+| `CREATOR_WALLET_KEY` | same — **damm-v2 only; does not exist with `VENUE=pumpfun`** (the launch setup) | unclaimed/unsplit fees + CREATOR SOL; can move the LP position NFT                  |
+| `ADMIN_TOKEN`        | same (≥ 32 chars, enforced in production and on mainnet)                        | pause/resume, PAYOUT_RATE within 0.3–0.8%, retries — **never** moves funds directly |
+| OPS                  | **address only**                                                                | nothing on the server                                                               |
 
 Players never sign anything and never connect a wallet; prizes go only to the address stored on the ticket.
 
@@ -21,7 +21,12 @@ Players never sign anything and never connect a wallet; prizes go only to the ad
   rebuild only after proven expiry, lease-fenced; a second landing hard-stops everything (`invariant`).
 - **Reconciler**: an unexplained PUMP _outflow_ from PRIZE (possible key compromise) pauses payouts.
 - **Mint watch**: a change to PUMP's Token-2022 extensions / transfer hook pauses payouts until reviewed.
-- **Venue boot checks**: pool mints, CREATOR owns the position NFT, fees accrue in PUMP only (with `SWAP=none`).
+- **Venue boot checks**: pump.fun — the coin is quoted in PUMP, its creator is the sharing config, the shareholders
+  are exactly PRIZE at `FEE_SPLIT_POOL` and OPS at the rest (a changed split refuses boot; an unrevoked sharing
+  admin alerts). DAMM v2 — pool mints, CREATOR owns the position NFT, fees accrue in PUMP only (with `SWAP=none`).
+- **Fee claims never move funds we didn't measure**: the pump.fun distribution is permissionless and pays the
+  shareholders' accounts directly; what the sweeper books is PRIZE's/OPS's token delta from the confirmed claim's own
+  meta, and the reconciler holds off booking PRIZE inflows while a claim is in flight (no double counting).
 - **Admin**: routes live in an encapsulated `/api/admin` plugin (auth decided by the router's match, not the raw
   URL), constant-time token compare, a note required on every action, every action audited (events + Telegram).
 - **Abuse limits**: per-IP (IPv6 bucketed by /64) and per-(IP, wallet) rate limits on `/api/enter` +

@@ -27,8 +27,10 @@ import { createUsdSources, poolPriceFromVenue, PriceOracleImpl } from './oracle/
 import { DbPricesStore } from './oracle/store'
 import { PayoutGateImpl } from './payouts/gate'
 import { PayoutWorker, type PayoutEvent } from './payouts/worker'
-import { FeeSweeper } from './sweeper/sweeper'
+import { DirectFeeSweeper } from './sweeper/direct'
+import { FeeSweeper, type Sweeper } from './sweeper/sweeper'
 import { DammV2Venue } from './venue/damm-v2'
+import { PumpfunVenue } from './venue/pumpfun'
 import { MemorySwap, MemoryVenue } from './venue/memory'
 import { DammPoolSwap } from './venue/swap-damm'
 import { JupiterSwap } from './venue/swap-jupiter'
@@ -53,7 +55,7 @@ export interface Services {
   monitor: WalletMonitor
   pauses: PauseRegistry
   worker: PayoutWorker
-  sweeper: FeeSweeper | null
+  sweeper: Sweeper | null
   bus: EventBus
   engine: RoundEngine
   scratch: ScratchService
@@ -204,7 +206,34 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       })
     }
 
-    if (env.VENUE === 'damm-v2') {
+    if (env.VENUE === 'pumpfun') {
+      if (!opsAddress || !isValidPublicKey(opsAddress)) {
+        throw new Error('VENUE=pumpfun needs a valid OPS_WALLET_ADDRESS (the 30% shareholder)')
+      }
+      const pumpfun = await PumpfunVenue.create({
+        connection,
+        payer: prize,
+        mint: new PublicKey(scratchyMint),
+        quoteMint: new PublicKey(pumpMint),
+        opsAddress: new PublicKey(opsAddress),
+        // ppm → bps (700 000 ppm = 7 000 bps = 70%)
+        expectedPrizeShareBps: Number(economy.feeSplitPoolPpm / 100n),
+        expectedCreatorFeeBps: Number(economy.poolTradingFeePpm / 100n),
+        priorityFeeMicroLamports: env.PRIORITY_FEE_MICROLAMPORTS,
+      })
+      for (const w of pumpfun.warnings) {
+        alerter.notify({
+          kind: 'venue.warning',
+          severity: 'warn',
+          message: `pump.fun venue: ${w}`,
+          immediate: true,
+        })
+      }
+      for (const n of pumpfun.notes) {
+        alerter.notify({ kind: 'venue.note', severity: 'info', message: `pump.fun venue: ${n}` })
+      }
+      venue = pumpfun
+    } else if (env.VENUE === 'damm-v2') {
       if (!creator || !env.VENUE_POOL_ADDRESS || !env.VENUE_POSITION_ADDRESS) {
         throw new Error(
           'VENUE=damm-v2 needs CREATOR_WALLET_KEY/ADDRESS, VENUE_POOL_ADDRESS, VENUE_POSITION_ADDRESS',
@@ -236,15 +265,17 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       }
       venue = damm
     } else {
-      throw new Error('CHAIN_MODE=solana requires VENUE=damm-v2')
+      throw new Error('CHAIN_MODE=solana requires VENUE=pumpfun (launch) or VENUE=damm-v2')
     }
 
     if (env.SWAP === 'damm-v2') {
       if (!creator) throw new Error('SWAP=damm-v2 needs the CREATOR key')
+      const swapPool = env.SWAP_POOL_ADDRESS ?? env.VENUE_POOL_ADDRESS
+      if (!swapPool) throw new Error('SWAP=damm-v2 needs SWAP_POOL_ADDRESS (or VENUE_POOL_ADDRESS)')
       swap = new DammPoolSwap({
         connection,
         owner: creator,
-        pool: new PublicKey(env.SWAP_POOL_ADDRESS ?? env.VENUE_POOL_ADDRESS),
+        pool: new PublicKey(swapPool),
         baseMint: new PublicKey(scratchyMint),
         quoteMint: new PublicKey(pumpMint),
       })
@@ -280,7 +311,7 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
     cacheSeconds: economy.priceCacheSeconds,
     store: new DbPricesStore(db),
     alerter,
-    scratchyPumpKey: `scratchy_pump:${env.VENUE_POOL_ADDRESS ?? 'memory'}`,
+    scratchyPumpKey: `scratchy_pump:${env.VENUE === 'pumpfun' ? `pumpfun:${scratchyMint}` : (env.VENUE_POOL_ADDRESS ?? 'memory')}`,
   })
   await oracle.init()
 
@@ -318,12 +349,16 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
   })
   const payoutWorker = worker
 
+  // the pump.fun venue pays PRIZE/OPS itself (no CREATOR wallet); every other venue claims to CREATOR first
+  const direct = venue.distributesDirectly === true
   if (env.SWEEPER_ENABLED) {
-    if (!creatorAddress || !opsAddress) {
+    if (!opsAddress || (!direct && !creatorAddress)) {
       alerter.notify({
         kind: 'sweep.disabled',
         severity: env.CHAIN_MODE === 'solana' ? 'critical' : 'info',
-        message: 'fee sweeper disabled: CREATOR key/address and OPS_WALLET_ADDRESS are required',
+        message: direct
+          ? 'fee sweeper disabled: OPS_WALLET_ADDRESS is required'
+          : 'fee sweeper disabled: CREATOR key/address and OPS_WALLET_ADDRESS are required',
         immediate: true,
       })
     } else if (!isValidPublicKey(opsAddress) && env.CHAIN_MODE === 'solana') {
@@ -332,24 +367,26 @@ export async function buildServices(config: AppConfig, opts: BuildOptions = {}):
       throw new Error('OPS_WALLET_ADDRESS must differ from the PRIZE and CREATOR wallets')
     }
   }
-  const sweeper =
-    env.SWEEPER_ENABLED && creatorAddress && opsAddress
-      ? new FeeSweeper({
-          db,
-          chain,
-          venue,
-          swap,
-          alerter,
-          economy,
-          creatorAddress,
-          prizeAddress,
-          opsAddress,
-          quoteMint: pumpMint,
-          baseMint: scratchyMint,
-          maxSlippageBps: env.SWEEP_MAX_SLIPPAGE_BPS,
-          onQueued: () => payoutWorker.wake(),
-        })
-      : null
+  const sweeper: Sweeper | null =
+    env.SWEEPER_ENABLED && direct && opsAddress
+      ? new DirectFeeSweeper({ db, venue, alerter, prizeAddress, opsAddress })
+      : env.SWEEPER_ENABLED && creatorAddress && opsAddress
+        ? new FeeSweeper({
+            db,
+            chain,
+            venue,
+            swap,
+            alerter,
+            economy,
+            creatorAddress,
+            prizeAddress,
+            opsAddress,
+            quoteMint: pumpMint,
+            baseMint: scratchyMint,
+            maxSlippageBps: env.SWEEP_MAX_SLIPPAGE_BPS,
+            onQueued: () => payoutWorker.wake(),
+          })
+        : null
 
   const bus = new EventBus()
   // payout status changes flow onto the same bus as everything else (websocket feed)

@@ -1,0 +1,51 @@
+# Fly.io config for the $SCRATCHY API (the same shape as cockfight-worker). Deploy from the REPO ROOT:
+#   fly launch --no-deploy --copy-config --config deploy/fly.api.toml   # once: creates the app
+#   fly postgres create --name scratchy-db && fly postgres attach scratchy-db -a scratchy-api   # sets DATABASE_URL
+#   fly secrets set -a scratchy-api ALLOW_MAINNET=yes PRIZE_WALLET_KEY=… ADMIN_TOKEN=… RPC_URL=… \
+#       SCRATCHY_MINT=… TELEGRAM_BOT_TOKEN=… TELEGRAM_CHAT_ID=…
+#   fly deploy . --config deploy/fly.api.toml --dockerfile deploy/Dockerfile.api --ha=false
+# --ha=false keeps it to ONE machine: the PRIZE key must have exactly one signer (see docs/RUNBOOK.md).
+# Then point Cloudflare `api.scratchyfees.fun` (proxied) at the Fly app (`fly certs add api.scratchyfees.fun`).
+
+app = "scratchy-api"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 90
+
+[env]
+  NODE_ENV = "production"
+  HOST = "0.0.0.0"
+  PORT = "4000"
+  DEPLOY_ID = "mainnet-1"
+  TRUST_CLOUDFLARE = "true"
+  CHAIN_MODE = "solana"
+  SOLANA_CLUSTER = "mainnet-beta"
+  PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+  PUMP_PRICE_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+  PRIZE_WALLET_ADDRESS = "HXvSiWxbvFsV7Y8NLgK5jK537EarX6v3PCns5SQSLGV1"
+  OPS_WALLET_ADDRESS = "Hqwjp8NAc9hyFxN1XUJoMQLotUdQuagwM2EpEMqCSjpF"
+  VENUE = "pumpfun"
+  SWAP = "none"
+  PRICE_SOURCE = "live"
+  # Secrets (fly secrets set): ALLOW_MAINNET, DATABASE_URL, ADMIN_TOKEN, RPC_URL, SCRATCHY_MINT,
+  # PRIZE_WALLET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, JUPITER_API_KEY (optional).
+
+[http_service]
+  internal_port = 4000
+  force_https = true
+  auto_stop_machines = "off"     # the round engine, sweeper and payout worker must never sleep
+  auto_start_machines = true
+  min_machines_running = 1
+
+[checks.alive]
+  type = "http"
+  port = 4000
+  method = "GET"
+  path = "/health"
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "20s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

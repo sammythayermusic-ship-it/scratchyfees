@@ -48,7 +48,12 @@ export interface SweepOutcome {
   advanced: number
 }
 
-export class FeeSweeper {
+/** What services.ts schedules: this claim-swap-split sweeper, or the direct one (sweeper/direct.ts). */
+export interface Sweeper {
+  runOnce(): Promise<SweepOutcome>
+}
+
+export class FeeSweeper implements Sweeper {
   constructor(private readonly d: SweeperDeps) {}
 
   async runOnce(): Promise<SweepOutcome> {

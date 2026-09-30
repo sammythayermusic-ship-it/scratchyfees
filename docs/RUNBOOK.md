@@ -44,32 +44,35 @@ While paused, scratches still reveal and wins **queue**. Nothing is dropped; the
 | `payouts_stuck`     | one PRIZE payout failed simulation 10× in a row                           | **manual** after fixing the cause                                     |
 | `manual`            | you, from the admin panel                                                 | you                                                                   |
 
-Hard (manual) pauses also stop the sweeper's 70% transfer **into** PRIZE, in case PRIZE is compromised. The 30%
-OPS leg keeps moving. Every admin action needs a written note, which is recorded in the event log and on Telegram.
+Hard (manual) pauses also stop the DAMM v2 sweeper's 70% transfer **into** PRIZE, in case PRIZE is compromised (the
+30% OPS leg keeps moving). On pump.fun the split happens inside the claim itself: if PRIZE is compromised, stop the
+process (see "Key compromise"). Every admin action needs a written note, which is recorded in the event log and on Telegram.
 
 ## Alerts → what to do
 
-| Alert (event kind)                             | Meaning / action                                                                                                                                                                                                                  |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `monitor.low_gas.paused`                       | Send SOL to PRIZE. Auto-resumes.                                                                                                                                                                                                  |
-| `monitor.low_pool.paused` / `monitor.no_price` | The pool is below the reserve (or no price yet). Rounds are **skipped** (no tickets) until it refills. Normal at a quiet launch; top up PRIZE with PUMP to speed it up.                                                           |
-| `monitor.creator_gas_low`                      | Send SOL to CREATOR (claims + splits need it).                                                                                                                                                                                    |
-| `breaker.tripped` → `breaker.verified`         | Normal variance at low participation: the round's payouts were held, re-derived and released. No action.                                                                                                                          |
-| `pause.breaker_mismatch`                       | **Stop.** A prize didn't re-derive. Don't resume until the round is understood: compare `/fair?round=N` with the DB. Contact the developer.                                                                                       |
-| `pause.invariant`                              | **Stop.** PUMP left PRIZE with no matching payout. Assume the key is compromised: see "Key compromise".                                                                                                                           |
-| `pause.mint_changed` / `mint.transfer_hook`    | PUMP's token config changed (e.g. a transfer hook was set). Look at the new hook program on Solscan. Resume from the admin panel only if payouts are still safe.                                                                  |
-| `pause.payouts_stuck`                          | A payout keeps failing simulation. Read its error in the admin panel ("problem payouts"), fix the cause, resume, then retry it.                                                                                                   |
-| `payout.failed`                                | 4 attempts provably didn't land (congestion). It retries automatically with backoff. No action unless it repeats.                                                                                                                 |
-| `payout.failed_permanent`                      | Deterministic error (e.g. the recipient's account is frozen). The PUMP stays in the pool; a jackpot goes back into the pot. Retry from the admin panel if the cause is fixed.                                                     |
-| `payout.rpc_trouble`                           | The RPC has been failing for a while (rate limit/outage). Payouts are delayed, not lost. Check the Helius dashboard; switch `RPC_URL` and restart if needed.                                                                      |
-| `payout.ata_recreated`                         | A wallet keeps closing its PUMP account and we keep paying rent (Decision D). `ATA_RECREATE_LIMIT` (default 2) already caps it: after two openings, that wallet's wins wait (queued, not lost) until it reopens its PUMP account. |
-| `sweep.claim_failed` / `sweep.error`           | The fee claim failed; nothing moved. It retries next interval. Check CREATOR SOL and the RPC.                                                                                                                                     |
-| `sweep.orphan`                                 | CREATOR holds PUMP that no sweep accounts for (an interrupted claim, or someone sent PUMP). Decide manually: send it to PRIZE/OPS yourself, or leave it.                                                                          |
-| `sweep.swap_failed` / `sweep.bag_guard`        | Only if the pool collects SCRATCHY fees (not the launch config). The SCRATCHY stays in CREATOR; the PUMP part still splits.                                                                                                       |
-| `sweep.disabled`                               | CREATOR key or OPS address missing, so fees are not being swept.                                                                                                                                                                  |
-| `invariant.inflow`                             | Unexplained PUMP **into** PRIZE (your top-up, someone's dust). Booked as a deposit; it joins the next pool. Informational.                                                                                                        |
-| `engine.error`                                 | The round engine tick failed (usually RPC). It retries every second; a missed boundary is caught up.                                                                                                                              |
-| `win.big` / `win.jackpot`                      | Celebrate. 🎉                                                                                                                                                                                                                     |
+| Alert (event kind)                             | Meaning / action                                                                                                                                                                                                                                 |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `monitor.low_gas.paused`                       | Send SOL to PRIZE. Auto-resumes.                                                                                                                                                                                                                 |
+| `monitor.low_pool.paused` / `monitor.no_price` | The pool is below the reserve (or no price yet). Rounds are **skipped** (no tickets) until it refills. Normal at a quiet launch; top up PRIZE with PUMP to speed it up.                                                                          |
+| `monitor.creator_gas_low`                      | Send SOL to CREATOR (claims + splits need it).                                                                                                                                                                                                   |
+| `breaker.tripped` → `breaker.verified`         | Normal variance at low participation: the round's payouts were held, re-derived and released. No action.                                                                                                                                         |
+| `pause.breaker_mismatch`                       | **Stop.** A prize didn't re-derive. Don't resume until the round is understood: compare `/fair?round=N` with the DB. Contact the developer.                                                                                                      |
+| `pause.invariant`                              | **Stop.** PUMP left PRIZE with no matching payout. Assume the key is compromised: see "Key compromise".                                                                                                                                          |
+| `pause.mint_changed` / `mint.transfer_hook`    | PUMP's token config changed (e.g. a transfer hook was set). Look at the new hook program on Solscan. Resume from the admin panel only if payouts are still safe.                                                                                 |
+| `pause.payouts_stuck`                          | A payout keeps failing simulation. Read its error in the admin panel ("problem payouts"), fix the cause, resume, then retry it.                                                                                                                  |
+| `payout.failed`                                | 4 attempts provably didn't land (congestion). It retries automatically with backoff. No action unless it repeats.                                                                                                                                |
+| `payout.failed_permanent`                      | Deterministic error (e.g. the recipient's account is frozen). The PUMP stays in the pool; a jackpot goes back into the pot. Retry from the admin panel if the cause is fixed.                                                                    |
+| `payout.rpc_trouble`                           | The RPC has been failing for a while (rate limit/outage). Payouts are delayed, not lost. Check the Helius dashboard; switch `RPC_URL` and restart if needed.                                                                                     |
+| `payout.ata_recreated`                         | A wallet keeps closing its PUMP account and we keep paying rent (Decision D). `ATA_RECREATE_LIMIT` (default 2) already caps it: after two openings, that wallet's wins wait (queued, not lost) until it reopens its PUMP account.                |
+| `sweep.claim_failed` / `sweep.error`           | The fee claim failed; nothing moved. It retries next interval. Check PRIZE SOL (pump.fun: PRIZE pays the claim) and the RPC.                                                                                                                     |
+| `sweep.interrupted`                            | pump.fun venue: the process died mid-claim. If the claim landed, its PUMP shows up as `invariant.inflow` and joins the pool — nothing is lost, it is just not attributed to a sweep row.                                                         |
+| `venue.warning` / `venue.note`                 | pump.fun venue, at boot. Warning: the creator fee is not 3%, or a wallet other than OPS holds the (unrevoked) sharing admin and could change the split. Note: OPS still holds the admin (kept on purpose so a compromised PRIZE can be rotated). |
+| `sweep.orphan` (damm-v2 only)                  | CREATOR holds PUMP that no sweep accounts for (an interrupted claim, or someone sent PUMP). Decide manually: send it to PRIZE/OPS yourself, or leave it.                                                                                         |
+| `sweep.swap_failed` / `sweep.bag_guard`        | Only if the pool collects SCRATCHY fees (not the launch config). The SCRATCHY stays in CREATOR; the PUMP part still splits.                                                                                                                      |
+| `sweep.disabled`                               | CREATOR key or OPS address missing, so fees are not being swept.                                                                                                                                                                                 |
+| `invariant.inflow`                             | Unexplained PUMP **into** PRIZE (your top-up, someone's dust). Booked as a deposit; it joins the next pool. Informational.                                                                                                                       |
+| `engine.error`                                 | The round engine tick failed (usually RPC). It retries every second; a missed boundary is caught up.                                                                                                                                             |
+| `win.big` / `win.jackpot`                      | Celebrate. 🎉                                                                                                                                                                                                                                    |
 
 ## Playbooks
 
@@ -77,7 +80,9 @@ OPS leg keeps moving. Every admin action needs a written note, which is recorded
 try again" (HTTP 503) instead of errors. If it lasts: put a second provider in `RPC_URL`,
 `systemctl restart scratchy-api`.
 
-**Key compromise (PRIZE or CREATOR).**
+**Key compromise (PRIZE, or CREATOR on DAMM v2).** On pump.fun, PRIZE is also the wallet that claims the creator fees and
+the 70% shareholder: after moving to a new PRIZE wallet you must also change the sharing config's shareholder on pump.fun
+(possible only while the sharing admin is not revoked — if it is, the 70% keeps flowing to the old wallet; drain it by hand).
 
 1. Admin → Pause (note: "key compromise").
 2. From a clean machine, move the remaining PUMP + SOL out of the compromised wallet with its key.
@@ -86,7 +91,7 @@ try again" (HTTP 503) instead of errors. If it lasts: put a second provider in `
    and start from a fresh database (or ask the developer to book the migration).
 5. Resume.
 
-For CREATOR: also transfer the LP position NFT to the new CREATOR, unless the position is locked (the NFT still
+For CREATOR (DAMM v2 only): also transfer the LP position NFT to the new CREATOR, unless the position is locked (the NFT still
 moves; the liquidity stays locked).
 
 **Payout throughput.** One payout = one transfer. `PAYOUT_CONCURRENCY` (default 4) controls parallel sends.

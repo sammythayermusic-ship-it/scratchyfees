@@ -88,7 +88,14 @@ const schema = z.object({
   MIN_CREATOR_GAS_SOL: str('0.05'),
 
   // Venue + sweeper
-  VENUE: z.enum(['memory', 'damm-v2']).default('memory'),
+  /**
+   * memory  — in-process pool (dev/tests)
+   * pumpfun — THE LAUNCH VENUE: pump.fun Custom Pair quoted in PUMP, 3% creator fee, "Share creator rewards"
+   *           70/30 → PRIZE/OPS on-chain; PRIZE claims permissionlessly, no CREATOR key on the server
+   * damm-v2 — Meteora DAMM v2 custom pool (kept for devnet rehearsals; blocked on mainnet until Meteora
+   *           badges PUMP for DAMM v2)
+   */
+  VENUE: z.enum(['memory', 'pumpfun', 'damm-v2']).default('memory'),
   VENUE_POOL_ADDRESS: optStr,
   VENUE_POSITION_ADDRESS: optStr,
   SWAP: z.enum(['none', 'jupiter', 'damm-v2', 'memory']).default('none'),
@@ -164,6 +171,24 @@ export function loadConfig(source: Record<string, string | undefined> = process.
   }
   if (env.NODE_ENV === 'production' && env.CHAIN_MODE !== 'solana') {
     throw new Error('NODE_ENV=production requires CHAIN_MODE=solana (memory mode is for local dev and tests)')
+  }
+  if (env.VENUE === 'pumpfun' && env.SWAP !== 'none') {
+    throw new Error('VENUE=pumpfun collects fees in PUMP only (the pair quote): set SWAP=none')
+  }
+  if (env.VENUE === 'pumpfun' && env.CHAIN_MODE === 'solana' && !env.OPS_WALLET_ADDRESS) {
+    throw new Error('VENUE=pumpfun needs OPS_WALLET_ADDRESS (the 30% shareholder of the creator fee)')
+  }
+  if (env.VENUE === 'pumpfun' && (env.CREATOR_WALLET_KEY || env.CREATOR_WALLET_ADDRESS)) {
+    throw new Error(
+      'VENUE=pumpfun needs no CREATOR wallet: the sharing config pays PRIZE and OPS directly — remove CREATOR_WALLET_KEY/ADDRESS',
+    )
+  }
+  if (env.SOLANA_CLUSTER === 'mainnet-beta' && env.VENUE === 'damm-v2') {
+    // PUMP keeps its Token-2022 transfer-hook authority and Meteora has not badged it for DAMM v2 (checked
+    // 2026-09-29): the pool cannot be created. The launch venue is pump.fun.
+    throw new Error(
+      'VENUE=damm-v2 is not launchable on mainnet (PUMP has no DAMM v2 token badge) — use VENUE=pumpfun',
+    )
   }
   if (env.SWAP === 'jupiter' && env.SOLANA_CLUSTER === 'mainnet-beta') {
     // the CREATOR key would sign a Jupiter-built tx checked only by its JSON metadata (security review #7);

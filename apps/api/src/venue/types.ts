@@ -1,6 +1,7 @@
 /**
  * Venue adapter (PLAN §1 / §3 fee sweeper): the launch venue is swappable behind this interface.
- * Implementations: `damm-v2` (Meteora DAMM v2 custom pool; devnet + mainnet) and `memory` (tests/local).
+ * Implementations: `damm-v2` (Meteora DAMM v2 custom pool), `pumpfun` (pump.fun Custom Pair with PUMP as quote
+ * and "Share creator rewards" paying PRIZE/OPS directly — the launch venue) and `memory` (tests/local).
  * "base" = $SCRATCHY, "quote" = PUMP. Amounts are raw base units.
  */
 export interface PoolState {
@@ -23,10 +24,18 @@ export interface ClaimResult {
   claimedQuoteRaw: bigint
   /** SCRATCHY actually received by CREATOR from the claim (0 under collectFeeMode = OnlyB) */
   claimedBaseRaw: bigint
+  /**
+   * Set when the venue paid the shares out itself (pump.fun sharing config): what PRIZE and OPS actually
+   * received in this claim (from the confirmed tx's own token deltas) and the slot it landed in. The sweeper
+   * then books the PRIZE inflow straight into the ledger — there is no CREATOR hop and nothing to split.
+   */
+  distributed?: { toPrizeRaw: bigint; toOpsRaw: bigint; slot: number }
 }
 
 export interface VenueAdapter {
   readonly name: string
+  /** true when claims land in PRIZE/OPS directly (ClaimResult.distributed); the direct sweeper is used */
+  readonly distributesDirectly?: boolean
   /** pool / vault / position addresses — auto-excluded from entries (they hold SCRATCHY but aren't players) */
   excludedAddresses(): string[]
   getPoolState(): Promise<PoolState>

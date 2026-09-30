@@ -12,7 +12,8 @@ Paste your Solana wallet into **scratchyfees.fun** (domain live, registered on C
 Why paste-only is safe: **payouts always go to the pasted holder wallet itself.** Pasting someone else's wallet just scratches on their behalf and pays *them*. There is nothing to steal, so no signature is needed. This is a core design win — say it in the FAQ.
 
 ### Locked product decisions
-- Launch: **$SCRATCHY paired with $PUMP** (mint: `pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn`), **3% trading fee on the pool**; the fee is the prize-pool source and **all prizes pay out in $PUMP tokens** — same fees-pay-winners architecture as cockfight. Launch venue must support a PUMP quote pair with a 3% fee claimable by the creator (Meteora DAMM v2-style pool with custom quote + fee collection, or equivalent; ⚠️ FLAG: confirm the exact launchpad/AMM with Sammy before Phase 2 chain work, and build the fee-sweeper behind an adapter interface so the venue is swappable)
+- Launch: **$SCRATCHY paired with $PUMP** (mint: `pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn`), **3% trading fee**; the fee is the prize-pool source and **all prizes pay out in $PUMP tokens** — same fees-pay-winners architecture as cockfight.
+  **Venue (decided 2026-09-29): pump.fun Custom Pair** quoted in PUMP with a 3% creator fee, and pump.fun's "Share creator rewards" splitting the fee **70% → PRIZE / 30% → OPS on-chain** — exactly cockfight's live setup. The API's `VENUE=pumpfun` adapter claims permissionlessly from PRIZE (`distribute_creator_fees_v2`, plus `transfer_creator_fees_to_pump_v2` after graduation); the shares land in PRIZE/OPS directly, so **no CREATOR key exists on the server**. Wallets: the cockfight pair (PRIZE = cockfight hot `HXvS…LGV1`, OPS = cockfight launch `Hqwj…Sjpf`). The earlier Meteora DAMM v2 plan is blocked on mainnet (PUMP keeps a Token-2022 transfer-hook authority and has no DAMM v2 token badge); that adapter stays for devnet rehearsals only.
 - Payout precision: a win's displayed USD value is an estimate; the paid amount is exact **in PUMP**, converted at the price known at reveal time. PUMP's price moves, so "close enough" is the explicit contract — never block or delay a payout chasing exact USD equivalence
 - Tickets scale with holdings, capped, with a **whale multiplier** above the cap
 - Payouts: **fully automatic, instant, everything including jackpots** (hot wallet signs with no human in the loop; hard clamps + circuit breaker are the only safeties)
@@ -91,8 +92,8 @@ At 0.5%/round the pool pays out ~51% of itself per day with zero inflow — but 
                                     │ Postgres    │ │ Solana RPC   │
                                     │             │ │ (Helius)     │
                                     └────────────┘ └──────────────┘
-Wallets: CREATOR (claims 3% pool fees)  → 70% → PRIZE (hot, holds PUMP, signs payouts)
-                                        → 30% → OPS (cold-ish)
+Wallets: pump.fun creator vault (3% fee) → claim (PRIZE-signed) → 70% → PRIZE (hot, holds PUMP, signs payouts)
+                                                                → 30% → OPS (cold; the launch wallet)
 ```
 
 - **Domain & edge (Cloudflare):** DNS for `scratchyfees.fun` lives in Sammy's Cloudflare account. Frontend at `https://scratchyfees.fun` (+ `www` redirect), API + WebSocket at `https://api.scratchyfees.fun` → the VPS. Proxy both through Cloudflare (orange-cloud): free DDoS protection, TLS, and edge rate-limit rules on `/api/enter` and `/api/scratch` as a first layer in front of the app's own limits. WebSockets pass through Cloudflare's proxy fine. Backend must set CORS to the apex origin only.
@@ -189,7 +190,7 @@ Next.js + Tailwind, framer-motion, canvas-confetti, howler. No heavy 3D engine �
 **Phase 3 — Round engine + API.** Cron rounds, entries, provably-fair seeds, scratch endpoint, websocket feed, rate limits.
 **Phase 4 — Frontend.** All pages + the full scratch experience per §6. Must feel incredible on a phone.
 **Phase 5 — Hardening + dry run.** Circuit breakers, pause switches, admin panel, load test scratch endpoint, then a full **devnet dress rehearsal**: fake fee inflow, 3 test wallets, 24h of accelerated rounds, verify every payout on-chain.
-**Phase 6 — Mainnet launch checklist.** Point Cloudflare DNS: apex + `www` → frontend, `api` subdomain → VPS, both proxied, edge rate-limit rules on. Launch $SCRATCHY paired with PUMP at 3% pool fee on the confirmed venue (creator/fee-claim wallet = the sweeper's CREATOR wallet), wire the real PUMP mint + pool address into config, fund the PRIZE wallet's seed (PUMP) + jackpot seed + SOL gas, point config at mainnet, `PAYOUT_RATE` 0.5%, breaker armed, Telegram wired, @ScratchyFees pinned post with the odds table + site link, go.
+**Phase 6 — Mainnet launch checklist** (`docs/LAUNCH-CHECKLIST.md`). Point Cloudflare DNS: apex + `www` → frontend, `api` subdomain → the API host, both proxied, edge rate-limit rules on. Launch $SCRATCHY on pump.fun as a Custom Pair quoted in PUMP at a 3% creator fee, set "Share creator rewards" to PRIZE 70 / OPS 30, wire `SCRATCHY_MINT` + `VENUE=pumpfun` into config, fund PRIZE (PUMP seed incl. jackpot seed + SOL gas), point config at mainnet, `PAYOUT_RATE` 0.5%, breaker armed, Telegram wired, @ScratchyFees pinned post with the odds table + site link, go.
 
 ## 9. Config reference
 ```

@@ -10,7 +10,7 @@ pre-rolled from a committed seed and can be re-derived by anyone on `/fair`. Ful
 | Path            | What                                                                                                                                                                                                                       |
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `packages/core` | Pure, isomorphic economy + provably-fair math (PLAN §2, §4). Exact integer math, zero I/O.                                                                                                                                 |
-| `apps/api`      | Fastify: round engine, exactly-once payouts, fee sweeper, monitor, reconciler, websocket.                                                                                                                                  |
+| `apps/api`      | Fastify: round engine, exactly-once payouts, fee sweeper (pump.fun / DAMM v2 venue adapters), monitor, reconciler, websocket.                                                                                              |
 | `apps/web`      | Next.js: the scratch experience, `/winners`, `/fair`, `/faq`, `/admin`.                                                                                                                                                    |
 | `assets/brand`  | Official brand art (untouched). `pnpm brand` derives the web crops.                                                                                                                                                        |
 | `docs/`         | [REHEARSAL](docs/REHEARSAL.md) · [ECONOMY](docs/ECONOMY.md) · [FAIRNESS](docs/FAIRNESS.md) · [SFX](docs/SFX.md) · [RUNBOOK](docs/RUNBOOK.md) · [LAUNCH-CHECKLIST](docs/LAUNCH-CHECKLIST.md) · [SECURITY](docs/SECURITY.md) |
@@ -57,6 +57,12 @@ RPC rate-limits hard; a free Helius devnet key in `RPC_URL` makes everything muc
 
 ## Mainnet
 
-Not touched by anything in this repo. [docs/LAUNCH-CHECKLIST.md](docs/LAUNCH-CHECKLIST.md) has the exact steps:
-the Meteora PUMP badge (a blocker), wallets, token, pool, funding, server, site, smoke, go.
+Not touched by anything in this repo until `ALLOW_MAINNET=yes`. **Launch venue: pump.fun** — a Custom Pair quoted in
+PUMP with a 3% creator fee, shared 70% → PRIZE / 30% → OPS through pump.fun's "Share creator rewards"
+(`VENUE=pumpfun`; the same setup cockfight runs). PRIZE claims the fees permissionlessly, so no CREATOR key exists on
+the server. [docs/LAUNCH-CHECKLIST.md](docs/LAUNCH-CHECKLIST.md) has the exact steps: wallets, coin, sharing config,
+funding, server, site, smoke, go. [docs/RUNBOOK.md](docs/RUNBOOK.md) explains every alert and pause.
+
+The Meteora DAMM v2 adapter (`VENUE=damm-v2`) remains for devnet rehearsals; it is refused on mainnet because PUMP
+has no DAMM v2 token badge (its Token-2022 transfer-hook authority is still set).
 [docs/RUNBOOK.md](docs/RUNBOOK.md) explains every alert and pause.

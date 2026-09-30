@@ -1,0 +1,26 @@
+# Build context for deploy/Dockerfile.api (context = repo root). Only the API and packages/core are needed.
+.git
+.github
+.claude
+.vscode
+.idea
+**/.DS_Store
+**/node_modules
+**/.next
+**/.next-*
+**/dist
+**/out
+**/coverage
+**/*.tsbuildinfo
+**/*.log
+**/.env
+**/.env.*
+.devnet
+.data
+_promo
+assets
+docs
+scripts
+*.tgz
+apps/web/*
+!apps/web/package.json
