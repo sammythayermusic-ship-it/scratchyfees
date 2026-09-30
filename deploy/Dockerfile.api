@@ -23,7 +23,7 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=4000
 WORKDIR /repo
-COPY --from=build /repo /repo
+COPY --from=build --chown=node:node /repo /repo
 USER node
 EXPOSE 4000
 STOPSIGNAL SIGTERM
