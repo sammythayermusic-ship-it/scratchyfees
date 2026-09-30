@@ -7,3 +7,4 @@ export const X_HANDLE = process.env.NEXT_PUBLIC_X_HANDLE ?? 'ScratchyFees'
 export const DOMAIN = 'scratchyfees.fun'
 /** PUMP has 6 decimals (the devnet mock mirrors it) */
 export const PUMP_DECIMALS = 6
+export const SCRATCHY_MINT = process.env.NEXT_PUBLIC_SCRATCHY_MINT ?? '7uwiFu48zz8R9dmGjshNNhHcK9By2xpjH6sm7xjtpump'

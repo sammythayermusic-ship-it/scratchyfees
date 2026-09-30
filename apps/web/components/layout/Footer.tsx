@@ -1,5 +1,5 @@
 import Link from 'next/link'
-import { DOMAIN, X_HANDLE } from '@/lib/config'
+import { DOMAIN, SCRATCHY_MINT, X_HANDLE } from '@/lib/config'
 
 export function Footer() {
   return (
@@ -10,7 +10,16 @@ export function Footer() {
           <img src="/brand/mascot-head.png" alt="" width={28} height={28} className="rounded-full" />
           <span>{DOMAIN} · prizes paid in $PUMP from the $SCRATCHY pool fee</span>
         </div>
-        <div className="flex gap-4">
+        <div className="flex flex-wrap items-center gap-4">
+          <a
+            href={`https://pump.fun/coin/${SCRATCHY_MINT}`}
+            target="_blank"
+            rel="noreferrer"
+            title={SCRATCHY_MINT}
+            className="font-mono hover:text-ink"
+          >
+            CA: {SCRATCHY_MINT.slice(0, 4)}…{SCRATCHY_MINT.slice(-8)}
+          </a>
           <Link href="/fair" className="hover:text-ink">
             Provably fair
           </Link>

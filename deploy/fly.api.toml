@@ -20,6 +20,7 @@ kill_timeout = 90
   TRUST_CLOUDFLARE = "true"
   CHAIN_MODE = "solana"
   SOLANA_CLUSTER = "mainnet-beta"
+  SCRATCHY_MINT = "7uwiFu48zz8R9dmGjshNNhHcK9By2xpjH6sm7xjtpump"
   PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
   PUMP_PRICE_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
   PRIZE_WALLET_ADDRESS = "HXvSiWxbvFsV7Y8NLgK5jK537EarX6v3PCns5SQSLGV1"
@@ -29,7 +30,7 @@ kill_timeout = 90
   PRICE_SOURCE = "live"
   # payouts (and rounds) start once the prize pool holds $30 of PUMP; below it rounds are skipped
   MIN_POOL_RESERVE_USD = "30"
-  # Secrets (fly secrets set): ALLOW_MAINNET, DATABASE_URL, ADMIN_TOKEN, RPC_URL, SCRATCHY_MINT,
+  # Secrets (fly secrets set): ALLOW_MAINNET, DATABASE_URL, ADMIN_TOKEN, RPC_URL,
   # PRIZE_WALLET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, JUPITER_API_KEY (optional).
 
 [http_service]
