@@ -62,7 +62,7 @@ mainnet key. Each `⛔` is a hard stop.
 ## 3. Fund
 
 - [ ] **PRIZE ← PUMP**: the opening prize pool. At the first round the engine seeds the jackpot with 1% of it and
-      books the balance as the genesis deposit. Payouts pause below `MIN_POOL_RESERVE_USD` ($300) worth of PUMP.
+      books the balance as the genesis deposit. Payouts pause below `MIN_POOL_RESERVE_USD` ($30 — the launch setting; the spec said $300) worth of PUMP.
 - [ ] **PRIZE ← SOL**: ≥ **0.5 SOL**. `MIN_GAS_SOL=0.1` pauses payouts below 0.1 SOL. Each first-time winner's PUMP
       account costs ~0.002 SOL of rent (always paid), and every fee claim costs a fraction of a cent of SOL.
 - [ ] Nothing to fund on OPS beyond what pump.fun needs to create the coin.

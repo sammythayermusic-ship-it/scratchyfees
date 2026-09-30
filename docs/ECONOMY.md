@@ -79,10 +79,11 @@ binds above PAYOUT_RATE ≈ 0.56% (tested at 0.8%). "Dumped below its snapshot t
    budget, not the 10% jackpot. Options if you want to close it (each changes a locked §2.4 rule): one jackpot roll
    per wallet per round, or jackpot odds weighted by `w`. J also keeps accruing in live rounds nobody plays and can
    grow larger than the free pool.
-6. **Low volume vs the reserve.** With MIN_POOL_RESERVE_USD = $300 and PAYOUT_RATE 0.5%, the pool needs ≥ $216/day
-   of inflow (≈ $12.9k/day of volume after Meteora's cut) to sit above the reserve; below that the engine skips
-   rounds until inflow refills it. From an empty pool at $40k/day the first ~71 rounds (~12 h) are skipped — the
-   launch seed deposit avoids that.
+6. **Low volume vs the reserve.** The launch setting is MIN_POOL_RESERVE_USD = $30 (the spec's $300 was lowered
+   on 2026-09-29 so payouts start as soon as the first ~$30 of fees land in PRIZE). With PAYOUT_RATE 0.5% the pool
+   needs ≥ $21.6/day of inflow (≈ $1k/day of volume at a 3% fee, 70% to the pool) to sit above the reserve; below
+   that the engine skips rounds until inflow refills it. At a $30 pool a round's budget is $0.15, so prizes are
+   cents until fees grow the pool — and every first-time winner still costs PRIZE ~0.002 SOL of PUMP-account rent.
 7. **Two jackpot hits in one round:** the first reveal takes the pot; a second gets what's left (≈ 0) with an
    "already claimed this round" treatment.
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_ECONOMY,
+  parseEconomyConfig,
   gasBelowMinimum,
   hysteresisState,
   poolReserveRaw,
@@ -17,10 +18,13 @@ describe('§2.5 breaker + pauses', () => {
     expect(wouldTripBreaker(100n, 201n, 300n)).toBe(true)
   })
 
-  it('MIN_POOL_RESERVE_USD $300 converts to PUMP at the last known price (rounded up)', () => {
-    // $0.0056/PUMP → 53,571.428571… PUMP → raw (6 dp) rounded up
+  it('MIN_POOL_RESERVE_USD $30 converts to PUMP at the last known price (rounded up)', () => {
+    // $0.0056/PUMP → 5,357.142857… PUMP → raw (6 dp) rounded up
     const r = poolReserveRaw(DEFAULT_ECONOMY, 5_600_000_000_000_000n, 6)
-    expect(r).toBe(53_571_428_572n)
+    expect(r).toBe(5_357_142_858n)
+    expect(
+      poolReserveRaw(parseEconomyConfig({ MIN_POOL_RESERVE_USD: '300' }), 5_600_000_000_000_000n, 6),
+    ).toBe(53_571_428_572n)
     expect(poolReserveRaw(DEFAULT_ECONOMY, null, 6)).toBeNull()
   })
 

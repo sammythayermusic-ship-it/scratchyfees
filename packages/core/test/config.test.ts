@@ -14,7 +14,7 @@ describe('§9 config reference', () => {
       JACKPOT_ODDS: '50000',
       SINGLE_PRIZE_CAP: '0.05',
       ROUND_BREAKER: '3.0',
-      MIN_POOL_RESERVE_USD: '300',
+      MIN_POOL_RESERVE_USD: '30',
       FEE_SPLIT_POOL: '0.70',
       POOL_TRADING_FEE: '0.03',
       MIN_GAS_SOL: '0.1',
@@ -30,7 +30,7 @@ describe('§9 config reference', () => {
       feeSplitPoolPpm: 700_000n,
       poolTradingFeePpm: 30_000n,
       minGasLamports: 100_000_000n,
-      minPoolReserveUsd: 300n,
+      minPoolReserveUsd: 30n,
     })
   })
 

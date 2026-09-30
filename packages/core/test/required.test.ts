@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest'
 import {
   CUMULATIVE_PPM,
   DEFAULT_ECONOMY,
+  parseEconomyConfig,
   expectedValueK10,
   poolReserveRaw,
   PPM,
@@ -190,9 +191,10 @@ describe('§8 required #4 — 30-day pool sim converges with steady inflow', () 
 
   it('an equilibrium below MIN_POOL_RESERVE skips rounds (engine behaviour) instead of paying from a sub-reserve pool', () => {
     // reserve = $300 at $0.0056 ≈ 53,571 PUMP; inflow sized so the no-reserve equilibrium would be ~41,667 PUMP
-    const reserve = poolReserveRaw(cfg, 5_600_000_000_000_000n, 6)!
+    const cfg300 = parseEconomyConfig({ MIN_POOL_RESERVE_USD: '300' })
+    const reserve = poolReserveRaw(cfg300, 5_600_000_000_000_000n, 6)!
     const res = simulatePool({
-      cfg,
+      cfg: cfg300,
       days: 10,
       initialPoolRaw: 0n,
       inflowPerDayRaw: 30_000_000_000n,

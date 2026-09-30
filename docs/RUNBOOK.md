@@ -36,7 +36,7 @@ While paused, scratches still reveal and wins **queue**. Nothing is dropped; the
 | Pause (reason)      | Trigger                                                                   | Resumes                                                               |
 | ------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `low_gas`           | PRIZE SOL < `MIN_GAS_SOL` (0.1)                                           | **automatically** once SOL ≥ 0.1 × 1.10 → just send SOL               |
-| `low_pool`          | pool P < `MIN_POOL_RESERVE_USD` ($300) of PUMP, or no price ever known    | **automatically** at reserve × 1.10 (fees refill it; or top up)       |
+| `low_pool`          | pool P < `MIN_POOL_RESERVE_USD` ($30) of PUMP, or no price ever known     | **automatically** at reserve × 1.10 (fees refill it; or top up)       |
 | breaker (per round) | a round's ticket payouts would exceed 3×B                                 | **automatically** at round end if every prize re-derives (Decision E) |
 | `breaker_mismatch`  | a revealed prize did **not** match its seed recomputation                 | **manual**: this is the bug the breaker exists to catch               |
 | `invariant`         | the PRIZE wallet holds **less** PUMP than the ledger explains, seen twice | **manual**: possible key compromise                                   |

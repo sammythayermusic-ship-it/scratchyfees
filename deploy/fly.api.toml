@@ -27,6 +27,8 @@ kill_timeout = 90
   VENUE = "pumpfun"
   SWAP = "none"
   PRICE_SOURCE = "live"
+  # payouts (and rounds) start once the prize pool holds $30 of PUMP; below it rounds are skipped
+  MIN_POOL_RESERVE_USD = "30"
   # Secrets (fly secrets set): ALLOW_MAINNET, DATABASE_URL, ADMIN_TOKEN, RPC_URL, SCRATCHY_MINT,
   # PRIZE_WALLET_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, JUPITER_API_KEY (optional).
 

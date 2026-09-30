@@ -6,6 +6,7 @@ packages:
 allowBuilds:
   esbuild: true
   sharp: true
+  workerd: true
   unrs-resolver: true
   '@tailwindcss/oxide': true
   '@embedded-postgres/darwin-arm64': true

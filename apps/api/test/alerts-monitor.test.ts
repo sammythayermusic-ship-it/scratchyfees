@@ -1,4 +1,7 @@
-import { DEFAULT_ECONOMY } from '@scratchy/core'
+import { parseEconomyConfig } from '@scratchy/core'
+
+/** the monitor tests were written against the spec's original $300 reserve (launch default is $30) */
+const ECONOMY_300 = parseEconomyConfig({ MIN_POOL_RESERVE_USD: '300' })
 import bs58 from 'bs58'
 import { randomBytes } from 'node:crypto'
 import { inspect } from 'node:util'
@@ -549,7 +552,7 @@ function monitorSetup(opts: { price?: bigint | null; alerter?: Alerter; creator?
     prizeAddress: PRIZE,
     creatorAddress: creator,
     pumpMint: MINT,
-    economy: DEFAULT_ECONOMY,
+    economy: ECONOMY_300,
     minCreatorGasLamports: SOL / 20n, // 0.05 SOL
     hysteresisPpm: 100_000n, // 10%
     getPumpUsdE18: () => ctl.price,

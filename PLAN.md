@@ -63,7 +63,7 @@ Verified: probabilities sum to 1.000000, EV = exactly `1.0e`, so expected round 
 ### 2.5 Safety clamps (automatic, no human)
 - Any single prize is clamped to **5% of current pool**.
 - If a round's realized payouts exceed **3 × B**, the payout engine pauses and fires an alert (Telegram + log). Simulation: with just 50 tickets in play, worst case over 2,000 trials was 2.85B; at 300+ tickets, max 1.43B. Statistically this trips only on a bug — which is exactly what it's for.
-- Payouts pause automatically if pool balance < `MIN_POOL_RESERVE` (default: PUMP worth ~$300 at last known price), or if the hot wallet's SOL gas balance < `MIN_GAS_SOL` (default 0.1 SOL — SPL token transfers still burn SOL for fees and ATA rent).
+- Payouts pause automatically if pool balance < `MIN_POOL_RESERVE` (default: PUMP worth ~$30 at last known price — lowered from $300 for launch), or if the hot wallet's SOL gas balance < `MIN_GAS_SOL` (default 0.1 SOL — SPL token transfers still burn SOL for fees and ATA rent).
 
 ### 2.6 Sustainability (simulated, 30 days)
 At 0.5%/round the pool pays out ~51% of itself per day with zero inflow — but it converges, never drains: equilibrium pool ≈ **1.4 days of fee inflow** (e.g. $40k/day of trading volume × 3% fee × 70% share = $840/day into the pool → pool stabilizes around ~$1,170 worth of PUMP, round budget ~$5.80, with tier-max single-ticket wins well over $100 at modest participation — all held and paid as PUMP, so these USD figures float with PUMP's price). Prizes scale automatically with volume: pump harder → pool grows → every number on the odds table grows. `PAYOUT_RATE` is a config knob (0.3%–0.8% sane range) adjustable from the admin panel.
@@ -197,7 +197,7 @@ Next.js + Tailwind, framer-motion, canvas-confetti, howler. No heavy 3D engine �
 PAYOUT_RATE=0.005          ROUND_SECONDS=600         MIN_HOLD_USD=50
 TICKETS_PER_50=5           TICKET_CAP=100            MULT_CAP=25
 JACKPOT_SHARE=0.10         JACKPOT_ODDS=50000        SINGLE_PRIZE_CAP=0.05
-ROUND_BREAKER=3.0          MIN_POOL_RESERVE_USD=300  FEE_SPLIT_POOL=0.70
+ROUND_BREAKER=3.0          MIN_POOL_RESERVE_USD=30   FEE_SPLIT_POOL=0.70
 POOL_TRADING_FEE=0.03      MIN_GAS_SOL=0.1           SWEEP_INTERVAL_MIN=5
 PUMP_MINT=pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn
 PRICE_CACHE_SECONDS=30     DOMAIN=scratchyfees.fun

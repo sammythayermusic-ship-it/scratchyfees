@@ -4,6 +4,23 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   transpilePackages: ['@scratchy/core'],
   poweredByHeader: false,
+  // www → apex (the worker serves both hostnames as custom domains)
+  async redirects() {
+    return [
+      {
+        source: '/',
+        has: [{ type: 'host', value: 'www.scratchyfees.fun' }],
+        destination: 'https://scratchyfees.fun/',
+        permanent: true,
+      },
+      {
+        source: '/:path+',
+        has: [{ type: 'host', value: 'www.scratchyfees.fun' }],
+        destination: 'https://scratchyfees.fun/:path+',
+        permanent: true,
+      },
+    ]
+  },
   // hardening (security review #11): no framing (clickjacking), no MIME sniffing, no referrer leaks off-site
   async headers() {
     return [
