@@ -39,3 +39,4 @@ web-bundle.tgz
 
 # promo video assets (large, not part of the build)
 _promo/
+.admin-token

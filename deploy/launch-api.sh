@@ -9,11 +9,14 @@ APP=scratchy-api
 CF=cockfight-worker
 export PATH="/opt/homebrew/bin:$PATH"
 
-read -rp "SCRATCHY mint address (from the pump.fun coin page): " SCRATCHY_MINT
+# usage: launch-api.sh [MINT]   (MINT may also be given as $1; REUSE=y skips the cockfight-secrets prompt)
+SCRATCHY_MINT=${1:-}
+[[ -n $SCRATCHY_MINT ]] || read -rp "SCRATCHY mint address (from the pump.fun coin page): " SCRATCHY_MINT
 [[ ${#SCRATCHY_MINT} -ge 32 ]] || { echo "that doesn't look like a mint"; exit 1; }
 
 cfget() { fly ssh console -a "$CF" -q -C "printenv $1" 2>/dev/null | tr -d '\r\n'; }
-read -rp "Reuse cockfight's Helius key, Telegram bot and hot wallet (= scratchy PRIZE) key? [Y/n] " reuse
+reuse=${REUSE:-}
+[[ -n $reuse ]] || read -rp "Reuse cockfight's Helius key, Telegram bot and hot wallet (= scratchy PRIZE) key? [Y/n] " reuse
 if [[ ${reuse:-y} != [nN]* ]]; then
   echo "   copying from $CF (values are not shown)…"
   HELIUS=$(cfget HELIUS_API_KEY); PRIZE_WALLET_KEY=$(cfget HOT_WALLET_KEYPAIR)
@@ -37,9 +40,12 @@ args=(ALLOW_MAINNET=yes "SCRATCHY_MINT=$SCRATCHY_MINT" "RPC_URL=$RPC_URL" "PRIZE
 [[ -n ${TELEGRAM_CHAT_ID:-} ]] && args+=("TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID")
 fly secrets set -a "$APP" --stage "${args[@]}" >/dev/null
 unset PRIZE_WALLET_KEY RPC_URL HELIUS TELEGRAM_BOT_TOKEN args
+# the admin token is written to a private file, never printed (it unlocks scratchyfees.fun/admin)
+TOKEN_FILE="$(pwd)/.admin-token"
+( umask 077; printf '%s\n' "$ADMIN_TOKEN" > "$TOKEN_FILE" )
+unset ADMIN_TOKEN
 echo
-echo "   ADMIN_TOKEN — save it in your password manager (unlocks scratchyfees.fun/admin):"
-echo "   $ADMIN_TOKEN"
+echo "   ADMIN_TOKEN saved to $TOKEN_FILE (chmod 600, git-ignored) — copy it into your password manager"
 echo
 
 echo "== deploying (one machine only — the PRIZE key must have exactly one signer)"
